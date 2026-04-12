@@ -1,0 +1,14 @@
+# ICAGO Itinerary Tool + Telegram Bot
+# pip install -r requirements.txt
+
+# Core PDF processing
+pdfplumber>=0.10.0
+reportlab>=4.0.0
+pillow>=10.0.0
+
+# Telegram Bot
+python-telegram-bot>=20.0
+
+# Web server (chỉ cần khi deploy lên Render)
+flask>=3.0.0
+gunicorn>=21.0.0
