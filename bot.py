@@ -41,7 +41,7 @@ from icago_itinerary import convert, DEFAULT_LOGO, DEFAULT_LUUY
 # Config
 # ══════════════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "8659136625:AAFcL4VweOqk5j6Sksu_HQCk3adz0bLH5gY")
 LOGO_PATH  = os.environ.get("LOGO_PATH", DEFAULT_LOGO)
 LUUY_PATH  = os.environ.get("LUUY_PATH", DEFAULT_LUUY)
 MAX_MB     = int(os.environ.get("MAX_MB", "20"))
