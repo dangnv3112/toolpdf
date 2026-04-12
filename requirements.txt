@@ -12,3 +12,11 @@ python-telegram-bot>=20.0
 # Web server (chỉ cần khi deploy lên Render)
 flask>=3.0.0
 gunicorn>=21.0.0
+
+python-telegram-bot>=20.0
+reportlab
+pillow
+pdfplumber
+playwright
+flask
+gunicorn
