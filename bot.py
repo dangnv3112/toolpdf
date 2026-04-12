@@ -3,29 +3,33 @@
 bot.py — ICAGO Telegram Bot
 =============================
 Flow 1 (PDF):
-  User gửi file PDF lịch trình → nhận PDF chuẩn ICAGO
+  User gửi file PDF lịch trình
+  → Bot xử lý bằng icago_itinerary.py
+  → Bot trả về file PDF đã format chuẩn ICAGO
 
 Flow 2 (PNR Code):
   User dán mã PNR text
-  → Gọi API pnrexpert.com (không cần browser/Chromium)
-  → Render HTML kết quả thành ảnh PNG bằng html2image / imgkit
-  → Bỏ dòng CO2 → gửi ảnh Telegram
+  → Bot mở pnrexpert.com bằng Playwright
+  → Quick Convert → chụp ảnh (bỏ dòng CO2) → gửi ảnh Telegram
 
-Deploy Render:
-  Build Command : pip install -r requirements.txt
-  Start Command : gunicorn bot:flask_app
-  Environment   : BOT_TOKEN, RENDER_URL
+Deploy:
+  Local  : python bot.py
+  Render : gunicorn bot:flask_app  (set RENDER_URL trong Environment)
 
-Cài đặt local:
-  pip install python-telegram-bot reportlab pillow pdfplumber
-               flask gunicorn requests beautifulsoup4 imgkit
-  + cài wkhtmltoimage: https://wkhtmltopdf.org/downloads.html
+Cài đặt:
+  pip install python-telegram-bot reportlab pillow pdfplumber playwright flask gunicorn
+  playwright install chromium
 """
 
-import os, re, logging, tempfile, asyncio, threading, json
+import os
+import re
+import logging
+import tempfile
+import asyncio
+import threading
 from pathlib import Path
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
+# ── Telegram ───────────────────────────────────────────────────────────────────
 try:
     from telegram import Update
     from telegram.ext import (
@@ -35,22 +39,31 @@ try:
 except ImportError:
     raise SystemExit("❌ pip install python-telegram-bot")
 
+# ── Core converter ─────────────────────────────────────────────────────────────
 from icago_itinerary import convert, DEFAULT_LOGO, DEFAULT_LUUY
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Config
 # ══════════════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN  = os.environ.get("BOT_TOKEN", "8659136625:AAFcL4VweOqk5j6Sksu_HQCk3adz0bLH5gY")
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
 LOGO_PATH  = os.environ.get("LOGO_PATH", DEFAULT_LOGO)
 LUUY_PATH  = os.environ.get("LUUY_PATH", DEFAULT_LUUY)
 MAX_MB     = int(os.environ.get("MAX_MB", "20"))
 RENDER_URL = os.environ.get("RENDER_URL", "").rstrip("/")
 
 if not BOT_TOKEN:
-    raise SystemExit("❌ Chưa set BOT_TOKEN.")
+    raise SystemExit(
+        "❌ Chưa set BOT_TOKEN.\n"
+        "   Linux/macOS : export BOT_TOKEN='xxx'\n"
+        "   Windows     : set BOT_TOKEN=xxx\n"
+        "   Render      : Environment → BOT_TOKEN"
+    )
 
-logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO,
+)
 log = logging.getLogger(__name__)
 
 
@@ -62,7 +75,7 @@ def looks_like_pnr(text: str) -> bool:
     lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
     if len(lines) < 2:
         return False
-    patterns = [
+    pnr_patterns = [
         r'\b[A-Z]{2}\d{2,4}\b',
         r'\b\d+\.[A-Z]+/[A-Z]+\b',
         r'\bHK\d+\b',
@@ -70,188 +83,95 @@ def looks_like_pnr(text: str) -> bool:
         r'^\s*\d+\s+[A-Z]{2}\s+\d{3,4}',
     ]
     combined = '\n'.join(lines[:10])
-    return sum(1 for p in patterns if re.search(p, combined)) >= 2
+    matches = sum(1 for p in pnr_patterns if re.search(p, combined))
+    return matches >= 2
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PNR → pnrexpert.com → PNG  (không dùng browser)
+# PNR → pnrexpert.com → Screenshot
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _fetch_pnr_html(pnr_text: str) -> str:
-    """
-    Gửi PNR lên pnrexpert.com qua HTTP POST (giống như nhấn Quick Convert).
-    Trả về HTML của phần kết quả.
-    """
-    import requests
-    from bs4 import BeautifulSoup
-
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Referer": "https://www.pnrexpert.com/",
-        "Origin":  "https://www.pnrexpert.com",
-    })
-
-    # Bước 1: Load trang để lấy token / cookie
-    r = session.get("https://www.pnrexpert.com/", timeout=20)
-    r.raise_for_status()
-
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    # Lấy CSRF token nếu có
-    csrf_input = soup.find("input", {"name": re.compile(r"csrf|token", re.I)})
-    csrf_value = csrf_input["value"] if csrf_input else ""
-
-    # Bước 2: POST PNR (quick convert endpoint)
-    # pnrexpert.com dùng AJAX — thử endpoint phổ biến
-    endpoints = [
-        "https://www.pnrexpert.com/api/convert",
-        "https://www.pnrexpert.com/convert",
-        "https://www.pnrexpert.com/",
-    ]
-
-    payload = {
-        "pnr":    pnr_text,
-        "layout": "3lines",   # layout mặc định free
-        "action": "quick",
-        "_token": csrf_value,
-    }
-
-    result_html = None
-    for ep in endpoints:
-        try:
-            resp = session.post(ep, data=payload, timeout=30)
-            if resp.ok and len(resp.text) > 200:
-                result_html = resp.text
-                log.info(f"✅ PNR convert thành công từ {ep}")
-                break
-        except Exception as e:
-            log.warning(f"Endpoint {ep} lỗi: {e}")
-
-    if not result_html:
+async def pnr_to_screenshot(pnr_text: str, output_png: str) -> str:
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
         raise RuntimeError(
-            "Không thể lấy kết quả từ pnrexpert.com.\n"
-            "Trang có thể yêu cầu JavaScript. Xem hướng dẫn bên dưới."
+            "Chưa cài Playwright:\n"
+            "pip install playwright && playwright install chromium"
         )
 
-    return result_html
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        page = await browser.new_page(viewport={"width": 1280, "height": 900})
 
+        log.info("🌐 Mở pnrexpert.com...")
+        await page.goto("https://www.pnrexpert.com/", timeout=30000)
+        await page.wait_for_load_state("networkidle", timeout=20000)
 
-def _html_to_png_imgkit(html: str, output_png: str):
-    """Dùng imgkit (wkhtmltoimage) để render HTML → PNG."""
-    import imgkit
-    options = {
-        "format":        "png",
-        "width":         "900",
-        "quiet":         "",
-        "disable-javascript": "",
-    }
-    imgkit.from_string(html, output_png, options=options)
+        log.info("📋 Dán mã PNR...")
+        textarea = await page.wait_for_selector(
+            "textarea, [placeholder*='PNR'], [placeholder*='pnr']",
+            timeout=10000,
+        )
+        await textarea.click()
+        await textarea.fill(pnr_text)
+        await asyncio.sleep(0.5)
 
+        log.info("🔄 Nhấn Quick Convert...")
+        quick_btn = None
+        for sel in [
+            "button:has-text('Quick Convert')",
+            "button:has-text('Quick')",
+            "input[value*='Quick']",
+        ]:
+            try:
+                quick_btn = await page.wait_for_selector(sel, timeout=5000)
+                if quick_btn:
+                    break
+            except Exception:
+                continue
 
-def _html_to_png_pillow(html_content: str, output_png: str):
-    """
-    Fallback: parse HTML bằng BeautifulSoup, vẽ text bằng Pillow.
-    Đơn giản nhưng không cần wkhtmltoimage.
-    """
-    from bs4 import BeautifulSoup
-    from PIL import Image, ImageDraw, ImageFont
+        if not quick_btn:
+            raise RuntimeError("Không tìm thấy nút Quick Convert.")
 
-    soup = BeautifulSoup(html_content, "html.parser")
+        await quick_btn.click()
 
-    # Xóa phần CO2 trước khi lấy text
-    for tag in soup.find_all(string=re.compile(r"CO2|Tonnes|tonne|carbon", re.I)):
-        parent = tag.parent
-        for _ in range(5):
-            if parent and parent.name in ("tr", "li", "div", "p", "td", "span"):
-                parent.decompose()
-                break
-            parent = parent.parent if parent else None
+        log.info("⏳ Chờ kết quả render...")
+        await asyncio.sleep(4)
 
-    # Lấy text sạch từ phần itinerary
-    result_div = (
-        soup.find(class_=re.compile(r"itinerary|result|preview|output", re.I))
-        or soup.find("body")
-        or soup
-    )
-    lines = [l for l in result_div.get_text("\n").splitlines() if l.strip()]
+        # Ẩn dòng CO2 bằng JS
+        await page.evaluate("""
+            () => {
+                const keywords = ['CO2', 'Tonnes', 'tonne', 'carbon', 'CARBON', 'CO\u2082'];
+                document.querySelectorAll('*').forEach(el => {
+                    if (el.children.length === 0) {
+                        const txt = (el.textContent || '').trim();
+                        if (keywords.some(k => txt.includes(k))) {
+                            let node = el;
+                            for (let i = 0; i < 5; i++) {
+                                if (!node) break;
+                                const tag = node.tagName;
+                                if (['TR','LI','DIV','P','SPAN','TD'].includes(tag)) {
+                                    node.style.setProperty('display', 'none', 'important');
+                                    break;
+                                }
+                                node = node.parentElement;
+                            }
+                        }
+                    }
+                });
+            }
+        """)
+        await asyncio.sleep(0.3)
 
-    # Vẽ lên ảnh
-    font_size  = 14
-    line_h     = font_size + 6
-    width      = 900
-    padding    = 20
-    height     = max(400, len(lines) * line_h + padding * 2)
-
-    img  = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(img)
-
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", font_size)
-        bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", font_size)
-    except Exception:
-        font = bold = ImageFont.load_default()
-
-    y = padding
-    bold_kw = re.compile(r"FLIGHT|DEPARTURE|ARRIVAL|OUTBOUND|RETURN", re.I)
-    for line in lines:
-        f = bold if bold_kw.search(line) else font
-        draw.text((padding, y), line, fill="black", font=f)
-        y += line_h
-        if y > height - padding:
-            break
-
-    img.save(output_png, "PNG")
-
-
-def _remove_co2_from_html(html: str) -> str:
-    """Xóa dòng/block chứa CO2 khỏi HTML trước khi render."""
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
-
-    keywords = re.compile(r"CO2|Tonnes|tonne|carbon emission|CARBON", re.I)
-    removed = 0
-    for tag in soup.find_all(string=keywords):
-        parent = tag.parent
-        for _ in range(6):
-            if not parent:
-                break
-            if parent.name in ("tr", "li", "div", "p", "td", "section", "span"):
-                parent.decompose()
-                removed += 1
-                break
-            parent = parent.parent
-    log.info(f"🧹 Đã xóa {removed} block CO2")
-    return str(soup)
-
-
-async def pnr_to_image(pnr_text: str, output_png: str) -> str:
-    """
-    Tổng hợp: lấy HTML từ pnrexpert.com → bỏ CO2 → render PNG.
-    Chạy blocking IO trong executor để không block event loop.
-    """
-    loop = asyncio.get_event_loop()
-
-    def _sync():
-        html = _fetch_pnr_html(pnr_text)
-        html = _remove_co2_from_html(html)
-
-        # Thử imgkit trước, fallback Pillow
-        try:
-            _html_to_png_imgkit(html, output_png)
-            log.info("✅ Render bằng imgkit")
-        except Exception as e1:
-            log.warning(f"imgkit lỗi ({e1}), dùng Pillow fallback...")
-            _html_to_png_pillow(html, output_png)
-            log.info("✅ Render bằng Pillow")
-
+        log.info("📸 Chụp screenshot...")
+        await page.screenshot(path=output_png, full_page=True)
+        await browser.close()
+        log.info(f"✅ Screenshot: {output_png}")
         return output_png
-
-    return await loop.run_in_executor(None, _sync)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -262,7 +182,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Xin chào! Tôi là *ICAGO PDF Bot*.\n\n"
         "📎 *Gửi file PDF* lịch trình → nhận PDF chuẩn ICAGO\n\n"
-        "✈️ *Dán mã PNR* (text GDS/Amadeus) → tôi convert trên pnrexpert.com và gửi ảnh\n\n"
+        "✈️ *Dán mã PNR* (text) → tôi tự convert trên pnrexpert.com và gửi ảnh\n\n"
         "📌 /help để xem hướng dẫn",
         parse_mode="Markdown",
     )
@@ -275,7 +195,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "   Gửi file PDF lịch trình → nhận PDF chuẩn ICAGO\n\n"
         "*2️⃣ PNR Code Mode:*\n"
         "   Dán mã PNR GDS/Amadeus vào chat\n"
-        "   Bot tự convert và gửi ảnh kết quả (đã ẩn CO2)\n\n"
+        "   Bot tự convert trên pnrexpert.com và gửi ảnh kết quả\n\n"
         f"⚠️ Giới hạn file: {MAX_MB} MB",
         parse_mode="Markdown",
     )
@@ -283,32 +203,46 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
+
     if not doc.file_name.lower().endswith(".pdf"):
         await update.message.reply_text("❌ Vui lòng gửi file *PDF*.", parse_mode="Markdown")
         return
+
     if doc.file_size > MAX_MB * 1024 * 1024:
         await update.message.reply_text(f"❌ File quá lớn (tối đa {MAX_MB} MB).")
         return
 
     status_msg = await update.message.reply_text("⏳ Đang xử lý PDF...")
-    log.info(f"PDF từ {update.effective_user.full_name}: {doc.file_name}")
+    user = update.effective_user
+    log.info(f"PDF từ {user.full_name}: {doc.file_name}")
 
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            inp = os.path.join(tmp, "input.pdf")
-            out_name = Path(doc.file_name).stem + "_ICAGO.pdf"
-            out = os.path.join(tmp, out_name)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_path  = os.path.join(tmp_dir, "input.pdf")
+            output_name = Path(doc.file_name).stem + "_ICAGO.pdf"
+            output_path = os.path.join(tmp_dir, output_name)
 
             tg_file = await ctx.bot.get_file(doc.file_id)
-            await tg_file.download_to_drive(inp)
-            convert(inp, out, logo_path=LOGO_PATH, luuy_path=LUUY_PATH, verbose=False)
+            await tg_file.download_to_drive(input_path)
 
-            with open(out, "rb") as f:
+            convert(
+                input_path=input_path,
+                output_path=output_path,
+                logo_path=LOGO_PATH,
+                luuy_path=LUUY_PATH,
+                verbose=False,
+            )
+
+            size_kb = os.path.getsize(output_path) // 1024
+            with open(output_path, "rb") as f:
                 await update.message.reply_document(
-                    document=f, filename=out_name,
-                    caption=f"✅ Hoàn thành! ({os.path.getsize(out)//1024} KB)",
+                    document=f,
+                    filename=output_name,
+                    caption=f"✅ Hoàn thành! ({size_kb} KB)",
                 )
+
         await status_msg.delete()
+
     except Exception as e:
         log.exception("Lỗi PDF")
         await status_msg.edit_text(f"❌ Lỗi:\n`{e}`", parse_mode="Markdown")
@@ -326,27 +260,33 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_pnr(update: Update, ctx: ContextTypes.DEFAULT_TYPE, pnr_text: str):
-    log.info(f"PNR từ {update.effective_user.full_name}: {pnr_text[:50]}...")
-    status_msg = await update.message.reply_text("✈️ Đang convert PNR trên pnrexpert.com...")
+    user = update.effective_user
+    log.info(f"PNR từ {user.full_name}: {pnr_text[:60]}...")
+
+    status_msg = await update.message.reply_text("✈️ Đang mở pnrexpert.com và convert...")
 
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            out_png = os.path.join(tmp, "pnr_result.png")
-            await pnr_to_image(pnr_text, out_png)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_png = os.path.join(tmp_dir, "pnr_result.png")
+            await pnr_to_screenshot(pnr_text, output_png)
 
-            with open(out_png, "rb") as f:
+            size_kb = os.path.getsize(output_png) // 1024
+            with open(output_png, "rb") as f:
                 await update.message.reply_photo(
                     photo=f,
-                    caption="✅ Kết quả từ pnrexpert.com (đã ẩn dòng CO2)",
+                    caption="✅ Kết quả pnrexpert.com (đã ẩn dòng CO2)",
                 )
+
         await status_msg.delete()
+        log.info(f"✅ Gửi ảnh PNR ({size_kb} KB)")
+
     except Exception as e:
         log.exception("Lỗi PNR")
         await status_msg.edit_text(f"❌ Lỗi xử lý PNR:\n`{e}`", parse_mode="Markdown")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Build PTB Application
+# Build Application
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_app() -> Application:
@@ -368,7 +308,8 @@ def run_bot():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RENDER — Flask webhook (gunicorn bot:flask_app)
+# RENDER — webhook qua Flask
+# gunicorn bot:flask_app
 # ══════════════════════════════════════════════════════════════════════════════
 
 try:
@@ -376,23 +317,27 @@ try:
 
     flask_app = Flask(__name__)
 
-    # Event loop nền
+    # --- Event loop nền để chạy async handlers ---
     _loop = asyncio.new_event_loop()
-    threading.Thread(
-        target=lambda: (_loop.run_forever()),
-        daemon=True
-    ).start()
 
-    # Khởi tạo PTB trong loop nền
+    def _run_loop(loop):
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    threading.Thread(target=_run_loop, args=(_loop,), daemon=True).start()
+
+    # --- PTB Application khởi tạo trong loop nền ---
     _tg_app = _build_app()
-    asyncio.run_coroutine_threadsafe(_tg_app.initialize(), _loop).result(timeout=15)
+    asyncio.run_coroutine_threadsafe(_tg_app.initialize(), _loop).result(timeout=10)
 
     @flask_app.route(f"/{BOT_TOKEN}", methods=["POST"])
     def webhook():
         data   = flask_request.get_json(force=True)
         update = Update.de_json(data, _tg_app.bot)
-        fut    = asyncio.run_coroutine_threadsafe(_tg_app.process_update(update), _loop)
-        fut.result(timeout=60)
+        future = asyncio.run_coroutine_threadsafe(
+            _tg_app.process_update(update), _loop
+        )
+        future.result(timeout=60)   # chờ tối đa 60s
         return "ok", 200
 
     @flask_app.route("/", methods=["GET"])
@@ -401,18 +346,27 @@ try:
 
     @flask_app.route("/set_webhook", methods=["GET"])
     def set_webhook():
-        import urllib.request
+        """Truy cập URL này một lần sau khi deploy để đăng ký webhook."""
+        import urllib.request, json as _json
         if not RENDER_URL:
-            return "❌ RENDER_URL chưa set", 400
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={RENDER_URL}/{BOT_TOKEN}"
-        with urllib.request.urlopen(url) as r:
-            result = json.loads(r.read())
+            return "❌ RENDER_URL chưa set trong Environment Variables", 400
+        wh_url = (
+            f"https://api.telegram.org/bot{BOT_TOKEN}"
+            f"/setWebhook?url={RENDER_URL}/{BOT_TOKEN}"
+        )
+        with urllib.request.urlopen(wh_url) as r:
+            result = _json.loads(r.read())
         log.info(f"setWebhook: {result}")
-        return f"✅ Webhook: {result}", 200
+        return f"✅ Webhook đã đăng ký: {result}", 200
 
 except ImportError:
     flask_app = None
+    log.warning("Flask không có → chỉ dùng polling local")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ══════════════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
     run_bot()
