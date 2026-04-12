@@ -13,6 +13,10 @@ python-telegram-bot>=20.0
 flask>=3.0.0
 gunicorn>=21.0.0
 
-requests
-beautifulsoup4
-
+python-telegram-bot>=20.0
+reportlab
+pillow
+pdfplumber
+playwright
+flask
+gunicorn
