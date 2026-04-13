@@ -1,6 +1,5 @@
-# ICAGO Tool — tất cả dependencies
+# ICAGO Tool — dependencies
 # pip install -r requirements.txt
-# python -m playwright install chromium
 
 # PDF processing
 pdfplumber>=0.10.0
@@ -10,7 +9,9 @@ pillow>=10.0.0
 # Telegram Bot
 python-telegram-bot>=20.0
 
-# Browser automation (PNR screenshot)
+# Browser automation
+# LOCAL  : pip install playwright && python -m playwright install chromium
+# RENDER : chỉ cần pip install playwright (dùng Browserless.io qua WebSocket)
 playwright>=1.40.0
 
 # Web server (Render deploy)

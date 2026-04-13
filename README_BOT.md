@@ -6,11 +6,10 @@
 icago_tool/
 ├── icago_itinerary.py   ← Core PDF converter
 ├── pnr_screenshot.py    ← PNR → pnrexpert.com → screenshot
-├── bot.py               ← Telegram Bot (gộp cả 2 tính năng)
+├── bot.py               ← Telegram Bot
 ├── icago_logo.png
 ├── icago_luuy.png
 ├── requirements.txt
-├── README.md
 └── README_BOT.md
 ```
 
@@ -20,103 +19,133 @@ icago_tool/
 
 | Người dùng gửi | Bot trả về |
 |----------------|-----------|
-| 📎 File PDF lịch trình | PDF đã format chuẩn ICAGO |
+| 📎 File PDF lịch trình | PDF chuẩn ICAGO |
 | ✈️ Mã PNR (text) | Ảnh lịch trình từ pnrexpert.com (bỏ dòng CO₂) |
 
 ---
 
-## Bước 1 — Tạo bot Telegram
-
-1. Mở Telegram → tìm **@BotFather** → `/newbot`
-2. Đặt tên & username (phải kết thúc bằng `bot`)
-3. Copy **token** (dạng `123456:ABCdef...`)
-
----
-
-## Bước 2 — Cài đặt
+## Cài đặt & Chạy LOCAL
 
 ```bash
 pip install -r requirements.txt
-python -m playwright install chromium
+python -m playwright install chromium   ← chỉ cần khi chạy local
+
+set BOT_TOKEN=123456:ABCdef...          ← Windows
+export BOT_TOKEN=123456:ABCdef...       ← macOS/Linux
+
+python bot.py
 ```
 
 ---
 
-## Bước 3 — Chạy local (test)
+## Deploy lên Render (24/7 miễn phí)
+
+### Bước 1 — Lấy token Telegram
+1. Telegram → @BotFather → `/newbot`
+2. Copy token `123456:ABCdef...`
+
+### Bước 2 — Đăng ký Browserless.io (FREE)
+
+> ⚠️ Render free tier không cài được Chrome.
+> Browserless.io cung cấp Chrome-as-a-Service miễn phí.
+
+1. Vào **https://browserless.io** → Sign up (free)
+2. Free plan: **1,000 sessions/tháng** (đủ dùng)
+3. Vào Dashboard → copy **API Token**
+
+### Bước 3 — Push code lên GitHub
 
 ```bash
-# Windows
-set BOT_TOKEN=123456:ABCdef...
-python bot.py
-
-# macOS / Linux
-export BOT_TOKEN=123456:ABCdef...
-python bot.py
-```
-
-Vào Telegram → tìm bot → thử:
-- Gửi `/start`
-- Gửi file PDF → nhận PDF ICAGO
-- Gửi mã PNR → nhận ảnh lịch trình
-
----
-
-## Bước 4 — Deploy lên Render (24/7 miễn phí)
-
-### 4.1 Push lên GitHub
-```bash
-git init && git add . && git commit -m "ICAGO Bot"
+git init
+git add .
+git commit -m "ICAGO Bot"
 git remote add origin https://github.com/YOUR_USER/icago-bot.git
 git push -u origin main
 ```
 
-### 4.2 Tạo Web Service trên render.com
+### Bước 4 — Tạo Web Service trên Render
 
 | Mục | Giá trị |
 |-----|---------|
 | Runtime | Python 3 |
-| Build Command | `pip install -r requirements.txt && python -m playwright install chromium && python -m playwright install-deps chromium` |
+| Build Command | `pip install -r requirements.txt` |
 | Start Command | `gunicorn bot:flask_app` |
 | Instance Type | Free |
 
-### 4.3 Environment Variables
+> ✅ KHÔNG cần `playwright install chromium` trên Render!
 
-| Key | Value |
-|-----|-------|
-| `BOT_TOKEN` | Token từ BotFather |
-| `RENDER_URL` | `https://icago-bot.onrender.com` |
+### Bước 5 — Set Environment Variables
 
-### 4.4 Đăng ký Webhook
+Vào tab **Environment** trên Render, thêm:
 
-Sau khi deploy xong, truy cập URL sau (thay TOKEN và YOUR_APP):
+| Key | Value | Ghi chú |
+|-----|-------|---------|
+| `BOT_TOKEN` | `123456:ABCdef...` | Token từ BotFather |
+| `RENDER_URL` | `https://icago-bot.onrender.com` | URL Render cấp |
+| `BROWSERLESS_TOKEN` | `your_browserless_token` | Token từ browserless.io |
+
+### Bước 6 — Đăng ký Webhook
+
+Sau khi deploy xong, mở URL sau trên trình duyệt:
+
 ```
 https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<YOUR_APP>.onrender.com/<TOKEN>
 ```
+
 Thấy `{"ok":true}` → thành công! 🎉
 
 ---
 
-## Ví dụ PNR hợp lệ
+## Biến môi trường đầy đủ
 
-```
-1.NGUYEN/VAN A
-3 VN 363 H 10JUL 4*SGNHAN HK1 0700 0900 10JUL E VN/ABC123
-4 VN 364 H 20JUL 2*HANSGNHK1 1000 1200 20JUL E VN/ABC123
-```
-
-Bot tự nhận dạng PNR nếu text có:
-- Dòng `1.HO/TEN`
-- Mã chuyến bay kiểu `BA 284`, `UA 7941`
-- Ngày kiểu GDS: `10JUL`, `07APR`
+| Biến | Bắt buộc | Mặc định | Mô tả |
+|------|----------|----------|-------|
+| `BOT_TOKEN` | ✅ | — | Token Telegram |
+| `BROWSERLESS_TOKEN` | ✅ (Render) | — | Token browserless.io |
+| `RENDER_URL` | Render only | — | URL app trên Render |
+| `LOGO_PATH` | | `icago_logo.png` | Đường dẫn logo |
+| `LUUY_PATH` | | `icago_luuy.png` | Đường dẫn ảnh Lưu ý |
+| `MAX_MB` | | `20` | Giới hạn upload PDF |
 
 ---
 
-## Biến môi trường
+## So sánh Local vs Render
 
-| Biến | Mặc định | Mô tả |
-|------|----------|-------|
-| `BOT_TOKEN` | *(bắt buộc)* | Token Telegram |
-| `RENDER_URL` | *(trống)* | URL Render — bật webhook |
-| `LOGO_PATH` | `icago_logo.png` | Logo ICAGO |
-| `LUUY_PATH` | `icago_luuy.png` | Ảnh Lưu ý |
-| `MAX_MB` | `20` | Giới hạn upload PDF |
+| | Local | Render + Browserless |
+|--|--|--|
+| Cài Chrome | Cần (`playwright install chromium`) | Không cần |
+| Chi phí | Miễn phí | Miễn phí |
+| Uptime 24/7 | Phụ thuộc máy | ✅ |
+| PNR sessions | Không giới hạn | 1,000/tháng (free) |
+| Setup | Đơn giản | Cần GitHub + Render + Browserless |
+
+---
+
+## Kiến trúc xử lý PNR
+
+```
+User gửi PNR text
+       │
+       ▼
+  bot.py nhận → looks_like_pnr() → True
+       │
+       ▼
+  pnr_screenshot.py
+       │
+       ├── BROWSERLESS_TOKEN có? ──→ Browserless.io (Render)
+       │                              Playwright kết nối qua WebSocket
+       │
+       └── Không? ─────────────→ Playwright local (Chrome máy tính)
+       │
+       ▼
+  pnrexpert.com
+  ├── paste PNR vào textarea
+  ├── click Quick Convert
+  ├── chờ kết quả
+  ├── JS: ẩn dòng "Tonnes of Co2"
+  ├── screenshot vùng kết quả
+  └── PIL: crop Co2 còn sót (double-check)
+       │
+       ▼
+  Bot gửi ảnh lại cho user
+```
