@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: icago-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn bot:flask_app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    envVars:
+      - key: BOT_TOKEN
+        sync: false          # nhập thủ công trong Render dashboard
+      - key: RENDER_URL
+        sync: false
+      - key: BROWSERLESS_TOKEN
+        sync: false
+      - key: PORT
+        value: 10000
