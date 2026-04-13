@@ -1,7 +1,8 @@
-# ICAGO Itinerary Tool + Telegram Bot
+# ICAGO Tool — tất cả dependencies
 # pip install -r requirements.txt
+# python -m playwright install chromium
 
-# Core PDF processing
+# PDF processing
 pdfplumber>=0.10.0
 reportlab>=4.0.0
 pillow>=10.0.0
@@ -9,6 +10,9 @@ pillow>=10.0.0
 # Telegram Bot
 python-telegram-bot>=20.0
 
-# Web server (chỉ cần khi deploy lên Render)
+# Browser automation (PNR screenshot)
+playwright>=1.40.0
+
+# Web server (Render deploy)
 flask>=3.0.0
 gunicorn>=21.0.0
