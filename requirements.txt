@@ -12,14 +12,3 @@ python-telegram-bot>=20.0
 # Web server (chỉ cần khi deploy lên Render)
 flask>=3.0.0
 gunicorn>=21.0.0
-<<<<<<< HEAD
-=======
-
-python-telegram-bot>=20.0
-reportlab
-pillow
-pdfplumber
-playwright
-flask
-gunicorn
->>>>>>> 493eebb728f7e535f3ced4f5e5c44c460f66a247
