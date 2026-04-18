@@ -64,7 +64,8 @@ CONTENT_W = PAGE_W - MARGIN_L - MARGIN_R
 FONT_MONO = "Courier"
 FONT_BOLD = "Courier-Bold"
 FONT_SIZE = 8.5
-LINE_H    = 12
+LINE_H    = 10.5   # tight line height — gần hơn so với 12
+EMPTY_H   = 4      # dòng trống nhỏ hơn nhiều so với dòng thường
 
 # ── Regex ──────────────────────────────────────────────────────────────────────
 _BOLD_RE = [
@@ -213,6 +214,19 @@ def process_lines(raw_lines, verbose=False):
     while body_lines and not body_lines[-1]:
         body_lines.pop()
 
+    # Collapse consecutive empty lines → tối đa 1 dòng trống liên tiếp
+    collapsed = []
+    prev_empty = False
+    for line in body_lines:
+        if not line.strip():
+            if not prev_empty:
+                collapsed.append(line)
+            prev_empty = True
+        else:
+            collapsed.append(line)
+            prev_empty = False
+    body_lines = collapsed
+
     if verbose:
         print(f"  [process] passengers: {passengers}")
         print(f"  [process] body lines: {len(body_lines)}")
@@ -267,9 +281,12 @@ class MonoLine(Flowable):
         self.bold   = bold or red
         self.color  = colors.red if red else (color or colors.black)
         self.width  = CONTENT_W
-        self.height = LINE_H
+        # Empty lines get smaller height to reduce gaps
+        self.height = EMPTY_H if not text.strip() else LINE_H
 
     def draw(self):
+        if not self.text.strip():
+            return  # empty line — just takes up vertical space
         self.canv.setFont(FONT_BOLD if self.bold else FONT_MONO, FONT_SIZE)
         self.canv.setFillColor(self.color)
         self.canv.drawString(0, 2, self.text)
@@ -293,7 +310,7 @@ def build_pdf(booking_ref, passengers, body_lines, output_path,
     # ── Logo ICAGO ─────────────────────────────────────────────────────────────
     if logo_path and os.path.isfile(logo_path):
         story.append(_scaled_image(logo_path, CONTENT_W))
-        story.append(Spacer(1, 8))
+        story.append(Spacer(1, 6))
     else:
         print(f"  ⚠️  Không tìm thấy logo: {logo_path}")
 
@@ -307,7 +324,7 @@ def build_pdf(booking_ref, passengers, body_lines, output_path,
         if re.match(r'^BOOKING\s+REF\s*:', p, re.IGNORECASE) and booking_ref:
             continue
         story.append(MonoLine(p, bold=False))
-    story.append(Spacer(1, 8))
+    story.append(Spacer(1, 5))
 
     # ── Body: nhóm thành flight blocks + KeepTogether ──────────────────────────
     blocks = group_into_blocks(body_lines)
@@ -340,7 +357,7 @@ def build_pdf(booking_ref, passengers, body_lines, output_path,
             print(f"    block {block_idx+1}: {len(block)} dòng")
 
     # ── Lưu ý ──────────────────────────────────────────────────────────────────
-    story.append(Spacer(1, 14))
+    story.append(Spacer(1, 8))
     if luuy_path and os.path.isfile(luuy_path):
         story.append(_scaled_image(luuy_path, CONTENT_W))
     else:
