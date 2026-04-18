@@ -53,73 +53,79 @@ JS_NO_ANIM = r"""() => {
     document.head.appendChild(s);
 }"""
 
-# ── JS chính: tìm element kết quả theo nhiều chiến lược ──────────────────────
-# Trả về {selector, x, y, w, h, scrollH} của ĐÚNG khung preview
+# ── JS chính: tìm ĐÚNG phần nội dung bảng chuyến bay (bên dưới toolbar) ──────
+# pnrexpert.com có cấu trúc: [toolbar buttons] → [bảng nội dung trắng]
+# Phải lấy phần nội dung (bảng trắng), KHÔNG lấy wrapper bao cả toolbar.
 JS_FIND_RESULT = r"""() => {
-    // Chiến lược 1: Tìm container của "Copy to Clipboard" button
-    // → đây là toolbar → lấy wrapper cha của nó
-    const copyBtn = Array.from(document.querySelectorAll('button, span, div'))
-        .find(el => /copy to clipboard/i.test(el.innerText || el.textContent || ''));
-    
-    if (copyBtn) {
-        // Leo lên tìm container lớn nhất chứa cả toolbar + nội dung
-        let cur = copyBtn.parentElement;
-        for (let i = 0; i < 8; i++) {
-            if (!cur || cur === document.body) break;
-            const r = cur.getBoundingClientRect();
-            if (r.width > 400 && cur.scrollHeight > 300) {
-                return {
-                    strategy: 'copy-btn-parent-' + i,
-                    x: Math.round(r.left), y: Math.round(r.top),
-                    w: Math.round(r.width), h: Math.round(r.height),
-                    scrollH: cur.scrollHeight,
-                };
-            }
-            cur = cur.parentElement;
-        }
-    }
+    // ── Chiến lược 1: Tìm phần tử chứa nội dung bảng bên dưới toolbar ─────────
+    // pnrexpert render nội dung vào một div có bg trắng, chứa table với
+    // thông tin DEPARTURE/ARRIVAL/Outbound/Return
+    const flightKeywords = /departs?:|arrives?:|outbound|return.*(?:city|airport)|duration:/i;
 
-    // Chiến lược 2: Element có scrollbar ngang (overflow-x) + chứa flight info
-    const keywords = /departs?|arrives?|outbound|return.*city|flight itinerary/i;
-    const scored = Array.from(document.querySelectorAll('div, section'))
+    // Tìm tất cả div/section có chứa nội dung chuyến bay thực sự
+    const candidates = Array.from(document.querySelectorAll('div, section, table'))
+        .filter(el => {
+            const txt = el.innerText || '';
+            if (!flightKeywords.test(txt)) return false;
+            const r = el.getBoundingClientRect();
+            // Phải có kích thước hợp lý và nằm trong viewport
+            if (r.width < 300 || r.height < 100) return false;
+            // Loại bỏ body và các container cực lớn bao cả trang
+            if (r.width > window.innerWidth * 0.98 && r.height > window.innerHeight * 1.5) return false;
+            return true;
+        })
         .map(el => {
             const r = el.getBoundingClientRect();
             const txt = el.innerText || '';
-            const hasContent = keywords.test(txt);
-            const hasHScroll = el.scrollWidth > el.clientWidth + 10;
-            const isLarge = r.width > 300 && r.height > 150;
-            if (!hasContent || !isLarge) return null;
-            return {
-                el, r,
-                score: (hasHScroll ? 5 : 0) + txt.length / 100,
-                scrollH: el.scrollHeight,
-            };
+            // Ưu tiên element nhỏ nhất vừa đủ chứa nội dung (tránh lấy wrapper to)
+            // Tính điểm: nhiều keyword = tốt, diện tích nhỏ = tốt
+            const keyCount = (txt.match(/departs?:|arrives?:|duration:|outbound|return/gi) || []).length;
+            const area = r.width * r.height;
+            return { el, r, keyCount, area, scrollH: el.scrollHeight };
         })
-        .filter(Boolean)
-        .sort((a, b) => b.score - a.score);
+        .filter(c => c.keyCount >= 2)
+        .sort((a, b) => {
+            // Ưu tiên: nhiều keyword hơn, diện tích nhỏ hơn
+            if (b.keyCount !== a.keyCount) return b.keyCount - a.keyCount;
+            return a.area - b.area;
+        });
 
-    if (scored.length > 0) {
-        const best = scored[0];
+    if (candidates.length > 0) {
+        const best = candidates[0];
         const r = best.r;
         return {
-            strategy: 'scroll-content',
+            strategy: 'flight-content-box',
             x: Math.round(r.left), y: Math.round(r.top),
             w: Math.round(r.width), h: Math.round(r.height),
             scrollH: best.scrollH,
         };
     }
 
-    // Chiến lược 3: Tìm element ngay dưới controls (Layout Themes section)
-    const controls = Array.from(document.querySelectorAll('*'))
-        .find(el => /layout themes/i.test(el.innerText || '') && 
-                    el.getBoundingClientRect().height < 200);
-    if (controls) {
-        let sib = controls.parentElement && controls.parentElement.nextElementSibling;
-        for (let i = 0; i < 5 && sib; i++) {
+    // ── Chiến lược 2: Tìm toolbar "Copy to Clipboard" → lấy SIBLING sau nó ────
+    // Toolbar và nội dung thường là anh em (siblings), không phải cha-con
+    const copyBtn = Array.from(document.querySelectorAll('button, span, div'))
+        .find(el => /copy to clipboard/i.test(el.innerText || el.textContent || ''));
+
+    if (copyBtn) {
+        // Tìm toolbar wrapper (cha gần nhất của nút Copy)
+        let toolbar = copyBtn;
+        for (let i = 0; i < 5; i++) {
+            const p = toolbar.parentElement;
+            if (!p || p === document.body) break;
+            const pr = p.getBoundingClientRect();
+            // Toolbar thường hẹp (height < 100px)
+            if (pr.height < 120) { toolbar = p; continue; }
+            break;
+        }
+
+        // Tìm sibling TIẾP THEO của toolbar — đó là bảng nội dung
+        let sib = toolbar.nextElementSibling;
+        for (let i = 0; i < 6 && sib; i++) {
             const r = sib.getBoundingClientRect();
-            if (r.width > 300 && r.height > 200) {
+            const txt = sib.innerText || '';
+            if (r.width > 300 && r.height > 150 && flightKeywords.test(txt)) {
                 return {
-                    strategy: 'after-controls-' + i,
+                    strategy: 'toolbar-next-sibling-' + i,
                     x: Math.round(r.left), y: Math.round(r.top),
                     w: Math.round(r.width), h: Math.round(r.height),
                     scrollH: sib.scrollHeight,
@@ -127,6 +133,54 @@ JS_FIND_RESULT = r"""() => {
             }
             sib = sib.nextElementSibling;
         }
+
+        // Nếu không tìm được sibling, leo lên 1 cấp rồi thử lại
+        const toolbarParent = toolbar.parentElement;
+        if (toolbarParent) {
+            sib = toolbarParent.nextElementSibling;
+            for (let i = 0; i < 4 && sib; i++) {
+                const r = sib.getBoundingClientRect();
+                const txt = sib.innerText || '';
+                if (r.width > 300 && r.height > 150 && flightKeywords.test(txt)) {
+                    return {
+                        strategy: 'toolbar-parent-next-' + i,
+                        x: Math.round(r.left), y: Math.round(r.top),
+                        w: Math.round(r.width), h: Math.round(r.height),
+                        scrollH: sib.scrollHeight,
+                    };
+                }
+                sib = sib.nextElementSibling;
+            }
+        }
+    }
+
+    // ── Chiến lược 3: bg trắng + có chứa table chuyến bay ────────────────────
+    const whiteBoxes = Array.from(document.querySelectorAll('div'))
+        .filter(el => {
+            const style = window.getComputedStyle(el);
+            const bg = style.backgroundColor;
+            const isWhite = bg === 'rgb(255, 255, 255)' || bg === 'rgba(0, 0, 0, 0)';
+            if (!isWhite) return false;
+            const r = el.getBoundingClientRect();
+            if (r.width < 400 || r.height < 200) return false;
+            const txt = el.innerText || '';
+            return flightKeywords.test(txt);
+        })
+        .map(el => {
+            const r = el.getBoundingClientRect();
+            return { el, r, scrollH: el.scrollHeight, area: r.width * r.height };
+        })
+        .sort((a, b) => a.area - b.area);
+
+    if (whiteBoxes.length > 0) {
+        const best = whiteBoxes[0];
+        const r = best.r;
+        return {
+            strategy: 'white-box',
+            x: Math.round(r.left), y: Math.round(r.top),
+            w: Math.round(r.width), h: Math.round(r.height),
+            scrollH: best.scrollH,
+        };
     }
 
     return null;
