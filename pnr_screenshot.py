@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 pnr_screenshot.py — PNR Expert Auto Screenshot
-Chụp đúng khung kết quả (dark preview panel) — full height, không bị cắt.
+Chụp đúng khung kết quả từ pnrexpert.com — nhanh, không timeout.
 """
 
 import asyncio
 import os
-import sys
 import tempfile
 
 try:
@@ -17,218 +16,218 @@ except ImportError:
 # ── Config ─────────────────────────────────────────────────────────────────────
 PNR_URL           = "https://www.pnrexpert.com/"
 VIEWPORT_W        = 1280
-VIEWPORT_H        = 900
+VIEWPORT_H        = 3000   # cao ngay từ đầu → không cần resize sau
 BROWSERLESS_TOKEN = os.environ.get("BROWSERLESS_TOKEN", "").strip()
 
-BL_WSS_ENDPOINTS = [
-    "wss://production-sfo.browserless.io?token={token}&launch=%7B%22stealth%22%3Atrue%7D",
-    "wss://production-sfo.browserless.io?token={token}",
-    "wss://production-lon.browserless.io?token={token}",
-    "wss://chrome.browserless.io?token={token}",
+BL_ENDPOINTS = [
+    "wss://production-sfo.browserless.io?token={t}",
+    "wss://production-sfo.browserless.io?token={t}&launch=%7B%22stealth%22%3Atrue%7D",
+    "wss://production-lon.browserless.io?token={t}",
+    "wss://chrome.browserless.io?token={t}",
 ]
 
 # ── JS: ẩn Co2 ─────────────────────────────────────────────────────────────────
-JS_HIDE_CO2 = r"""
-() => {
-    let count = 0;
+JS_HIDE_CO2 = r"""() => {
+    let n = 0;
     document.querySelectorAll('*').forEach(el => {
-        const txt = el.innerText || el.textContent || '';
-        if (/tonnes?\s+of\s+co2/i.test(txt) && el.children.length === 0) {
+        if (el.children.length === 0 &&
+            /tonnes?\s+of\s+co2/i.test(el.textContent || '')) {
             let cur = el;
-            for (let i = 0; i < 6; i++) {
-                if (!cur || cur === document.body) break;
-                const t = cur.innerText || '';
-                if (/tonnes?\s+of\s+co2/i.test(t) &&
-                    !/depart|arriv|flight|outbound|return/i.test(t)) {
-                    cur.style.cssText += 'display:none!important;';
-                    count++;
-                    break;
+            for (let i = 0; i < 6 && cur && cur !== document.body; i++) {
+                if (/tonnes?\s+of\s+co2/i.test(cur.innerText || '') &&
+                    !/depart|arriv|flight|outbound|return/i.test(cur.innerText || '')) {
+                    cur.style.display = 'none';
+                    n++; break;
                 }
                 cur = cur.parentElement;
             }
         }
     });
+    return n;
+}"""
+
+# ── JS: tắt animation ──────────────────────────────────────────────────────────
+JS_NO_ANIM = r"""() => {
     const s = document.createElement('style');
     s.textContent = '*{animation:none!important;transition:none!important;}';
-    document.head && document.head.appendChild(s);
-    return count;
-}
-"""
+    document.head.appendChild(s);
+}"""
 
-# ── JS: tìm ĐÚNG khung preview kết quả (dark panel) ──────────────────────────
-JS_FIND_PREVIEW = r"""
-() => {
-    // pnrexpert.com: khung kết quả là div scrollable chứa nội dung chuyến bay
-    // Thường có class chứa "preview", "output", "result", hoặc có background tối
-
-    const flightKeywords = /departs?|arrives?|outbound|return.*city|flight itinerary/i;
-
-    // Ưu tiên 1: tìm element scrollable (overflow) chứa nội dung flight
-    const allEls = Array.from(document.querySelectorAll('div, section, article'));
+# ── JS chính: tìm element kết quả theo nhiều chiến lược ──────────────────────
+# Trả về {selector, x, y, w, h, scrollH} của ĐÚNG khung preview
+JS_FIND_RESULT = r"""() => {
+    // Chiến lược 1: Tìm container của "Copy to Clipboard" button
+    // → đây là toolbar → lấy wrapper cha của nó
+    const copyBtn = Array.from(document.querySelectorAll('button, span, div'))
+        .find(el => /copy to clipboard/i.test(el.innerText || el.textContent || ''));
     
-    // Sắp xếp theo diện tích lớn nhất trước
-    const candidates = allEls
+    if (copyBtn) {
+        // Leo lên tìm container lớn nhất chứa cả toolbar + nội dung
+        let cur = copyBtn.parentElement;
+        for (let i = 0; i < 8; i++) {
+            if (!cur || cur === document.body) break;
+            const r = cur.getBoundingClientRect();
+            if (r.width > 400 && cur.scrollHeight > 300) {
+                return {
+                    strategy: 'copy-btn-parent-' + i,
+                    x: Math.round(r.left), y: Math.round(r.top),
+                    w: Math.round(r.width), h: Math.round(r.height),
+                    scrollH: cur.scrollHeight,
+                };
+            }
+            cur = cur.parentElement;
+        }
+    }
+
+    // Chiến lược 2: Element có scrollbar ngang (overflow-x) + chứa flight info
+    const keywords = /departs?|arrives?|outbound|return.*city|flight itinerary/i;
+    const scored = Array.from(document.querySelectorAll('div, section'))
         .map(el => {
             const r = el.getBoundingClientRect();
             const txt = el.innerText || '';
-            const hasContent = flightKeywords.test(txt);
-            const isScrollable = el.scrollHeight > el.clientHeight + 10;
-            const isLarge = r.width > 300 && r.height > 100;
-            return { el, r, txt, hasContent, isScrollable, isLarge,
-                     score: (hasContent ? 10 : 0) + (isScrollable ? 5 : 0) + (isLarge ? 3 : 0) };
+            const hasContent = keywords.test(txt);
+            const hasHScroll = el.scrollWidth > el.clientWidth + 10;
+            const isLarge = r.width > 300 && r.height > 150;
+            if (!hasContent || !isLarge) return null;
+            return {
+                el, r,
+                score: (hasHScroll ? 5 : 0) + txt.length / 100,
+                scrollH: el.scrollHeight,
+            };
         })
-        .filter(c => c.hasContent && c.isLarge)
-        .sort((a, b) => b.score - a.score || b.r.width * b.r.height - a.r.width * a.r.height);
+        .filter(Boolean)
+        .sort((a, b) => b.score - a.score);
 
-    if (candidates.length === 0) return null;
+    if (scored.length > 0) {
+        const best = scored[0];
+        const r = best.r;
+        return {
+            strategy: 'scroll-content',
+            x: Math.round(r.left), y: Math.round(r.top),
+            w: Math.round(r.width), h: Math.round(r.height),
+            scrollH: best.scrollH,
+        };
+    }
 
-    const best = candidates[0];
-    const el   = best.el;
-    const r    = best.r;
+    // Chiến lược 3: Tìm element ngay dưới controls (Layout Themes section)
+    const controls = Array.from(document.querySelectorAll('*'))
+        .find(el => /layout themes/i.test(el.innerText || '') && 
+                    el.getBoundingClientRect().height < 200);
+    if (controls) {
+        let sib = controls.parentElement && controls.parentElement.nextElementSibling;
+        for (let i = 0; i < 5 && sib; i++) {
+            const r = sib.getBoundingClientRect();
+            if (r.width > 300 && r.height > 200) {
+                return {
+                    strategy: 'after-controls-' + i,
+                    x: Math.round(r.left), y: Math.round(r.top),
+                    w: Math.round(r.width), h: Math.round(r.height),
+                    scrollH: sib.scrollHeight,
+                };
+            }
+            sib = sib.nextElementSibling;
+        }
+    }
 
-    // Lấy scrollHeight thực sự (full height kể cả phần bị cắt)
-    return {
-        x:            Math.round(r.left),
-        y:            Math.round(r.top),
-        w:            Math.round(r.width),
-        h_visible:    Math.round(r.height),        // chiều cao nhìn thấy
-        h_full:       el.scrollHeight,             // chiều cao thực (full)
-        scrollable:   el.scrollHeight > el.clientHeight + 10,
-        tag:          el.tagName,
-        className:    el.className.toString().slice(0, 80),
-    };
-}
-"""
+    return null;
+}"""
 
-# ── JS: scroll element về top và expand để lấy full height ───────────────────
-JS_EXPAND_AND_RESET = r"""
-() => {
-    // Tìm lại element và:
-    // 1. Bỏ overflow hidden/scroll để nội dung hiện full
-    // 2. Scroll về đầu
-    const flightKeywords = /departs?|arrives?|outbound|return.*city|flight itinerary/i;
-    const allEls = Array.from(document.querySelectorAll('div, section, article'));
+# ── JS: bỏ overflow để hiện full nội dung ─────────────────────────────────────
+JS_REMOVE_OVERFLOW = r"""(selector_info) => {
+    // Tìm lại element theo tọa độ và bỏ overflow
+    if (!selector_info) return 0;
+    const { x, y, w } = selector_info;
+    const el = document.elementFromPoint(x + w/2, y + 10);
+    if (!el) return 0;
     
-    const candidates = allEls
-        .filter(el => {
-            const txt = el.innerText || '';
-            const r = el.getBoundingClientRect();
-            return flightKeywords.test(txt) && r.width > 300 && r.height > 100;
-        })
-        .sort((a, b) => {
-            const ra = a.getBoundingClientRect();
-            const rb = b.getBoundingClientRect();
-            return (rb.width * rb.height) - (ra.width * ra.height);
-        });
-
-    if (candidates.length === 0) return 0;
-
-    const el = candidates[0];
-    // Bỏ giới hạn height và overflow để nội dung hiện đầy đủ
-    el.style.cssText += `
-        overflow: visible !important;
-        max-height: none !important;
-        height: auto !important;
-    `;
-    el.scrollTop = 0;
-    
-    // Làm tương tự các con trực tiếp
-    Array.from(el.children).forEach(child => {
-        child.style.cssText += 'overflow: visible !important; max-height: none !important;';
-    });
-
-    return el.scrollHeight;
-}
-"""
+    let cur = el;
+    for (let i = 0; i < 10; i++) {
+        if (!cur || cur === document.body) break;
+        const r = cur.getBoundingClientRect();
+        if (r.width > 300 && cur.scrollHeight > 200) {
+            const style = window.getComputedStyle(cur);
+            if (style.overflow !== 'visible' || style.overflowY !== 'visible') {
+                cur.style.overflow = 'visible';
+                cur.style.maxHeight = 'none';
+                cur.style.height = 'auto';
+            }
+        }
+        cur = cur.parentElement;
+    }
+    return 1;
+}"""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Core flow
+# Core automation flow
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _run_flow(page, pnr_text: str, output_path: str, verbose: bool) -> bool:
-    """
-    Paste PNR → Quick Convert → chờ kết quả → ẩn Co2
-    → chụp ĐÚNG khung kết quả full height.
-    """
     try:
-        # 1. Mở trang
-        if verbose: print("  [flow] mở pnrexpert.com ...")
-        await page.goto(PNR_URL, timeout=30_000, wait_until="domcontentloaded")
-        try:
-            await page.wait_for_load_state("networkidle", timeout=15_000)
-        except Exception:
-            pass
+        # 1. Mở trang — chỉ chờ DOMContentLoaded (nhanh hơn networkidle)
+        if verbose: print("  [1] goto pnrexpert.com...")
+        await page.goto(PNR_URL, timeout=25_000, wait_until="domcontentloaded")
+        # Chờ textarea xuất hiện thay vì networkidle
+        await page.wait_for_selector("textarea", timeout=10_000)
 
         # 2. Paste PNR
-        if verbose: print("  [flow] paste PNR...")
-        ta = await page.wait_for_selector("textarea", timeout=10_000)
+        if verbose: print("  [2] paste PNR...")
+        ta = page.locator("textarea").first
         await ta.click()
         await ta.fill(pnr_text.strip())
-        await asyncio.sleep(0.5)
 
-        # 3. Quick Convert
-        if verbose: print("  [flow] click Quick Convert...")
-        btn = await page.wait_for_selector(
-            "button:has-text('Quick Convert')", timeout=10_000
-        )
-        await btn.click()
+        # 3. Click Quick Convert
+        if verbose: print("  [3] Quick Convert...")
+        await page.locator("button:has-text('Quick Convert')").click()
 
-        # 4. Chờ nội dung flight xuất hiện
-        if verbose: print("  [flow] chờ kết quả...")
+        # 4. Chờ kết quả — dùng wait_for_selector thay vì wait_for_function
+        if verbose: print("  [4] chờ kết quả...")
         try:
+            # Chờ element có text "Departs" hoặc "Outbound" → kết quả đã render
             await page.wait_for_function(
-                r"() => /departs?:/i.test(document.body.innerText)",
-                timeout=25_000,
+                r"() => document.body.innerText.includes('Departs') || "
+                r"      document.body.innerText.includes('Outbound')",
+                timeout=20_000,
+                polling=500,   # check mỗi 500ms thay vì default 100ms
             )
+            if verbose: print("  [4] ✅ kết quả đã hiện")
         except Exception:
-            if verbose: print("  [flow] ⚠️ timeout — tiếp tục")
-        await asyncio.sleep(2.5)  # buffer để render xong
+            if verbose: print("  [4] ⚠️ timeout — thử chụp")
+        await asyncio.sleep(1)   # buffer nhỏ để render xong
 
-        # 5. Ẩn Co2
+        # 5. Tắt animation + ẩn Co2
+        await page.evaluate(JS_NO_ANIM)
         n = await page.evaluate(JS_HIDE_CO2)
-        if verbose: print(f"  [flow] ẩn {n} phần tử Co2")
+        if verbose: print(f"  [5] ẩn {n} Co2 element")
 
-        # 6. Expand overflow + scroll top để lấy full height
-        full_h = await page.evaluate(JS_EXPAND_AND_RESET)
-        if verbose: print(f"  [flow] scrollHeight sau expand = {full_h}px")
-        await asyncio.sleep(0.5)
+        # 6. Tìm khung kết quả
+        info = await page.evaluate(JS_FIND_RESULT)
+        if verbose: print(f"  [6] result box: {info}")
 
-        # 7. Tìm bounding box khung kết quả
-        info = await page.evaluate(JS_FIND_PREVIEW)
-        if verbose: print(f"  [flow] preview info = {info}")
-
-        if info and info.get("w", 0) > 200:
-            x        = max(0, info["x"] - 4)
-            y        = max(0, info["y"] - 4)
-            width    = min(VIEWPORT_W - x, info["w"] + 8)
-            # Dùng scrollHeight (chiều cao thực) thay vì clientHeight (bị cắt)
-            height   = info["h_full"] + 8
-
-            # Phóng viewport cao hơn để chứa đủ nội dung
-            needed_h = int(y + height + 50)
-            if needed_h > VIEWPORT_H:
-                await page.set_viewport_size({"width": VIEWPORT_W, "height": needed_h})
-                await asyncio.sleep(0.3)
-                # Lấy lại bounding box sau khi resize
-                info2 = await page.evaluate(JS_FIND_PREVIEW)
-                if info2:
-                    x     = max(0, info2["x"] - 4)
-                    y     = max(0, info2["y"] - 4)
-                    width = min(VIEWPORT_W - x, info2["w"] + 8)
-
-            clip = {"x": x, "y": y, "width": width, "height": height}
-            if verbose: print(f"  [flow] clip = {clip}")
-            await page.screenshot(path=output_path, clip=clip, full_page=False)
-
-        else:
-            # Fallback: chụp full page
-            if verbose: print("  [flow] fallback: full_page screenshot")
+        if not info:
+            if verbose: print("  [6] ⚠️ không tìm thấy khung — chụp full page")
             await page.screenshot(path=output_path, full_page=True)
+            return os.path.getsize(output_path) > 5000
+
+        # 7. Bỏ overflow để nội dung không bị cắt
+        await page.evaluate(JS_REMOVE_OVERFLOW, info)
+        await asyncio.sleep(0.3)
+
+        # 8. Tính clip — dùng scrollH (chiều cao thực, không bị cắt)
+        PAD = 10
+        x   = max(0, info["x"] - PAD)
+        y   = max(0, info["y"] - PAD)
+        w   = min(VIEWPORT_W - x, info["w"] + PAD * 2)
+        h   = info["scrollH"] + PAD * 2
+
+        clip = {"x": x, "y": y, "width": w, "height": h}
+        if verbose: print(f"  [8] clip: {clip}")
+
+        await page.screenshot(path=output_path, clip=clip, full_page=False)
 
         size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
-        if verbose: print(f"  [flow] ✅ saved {output_path} ({size//1024} KB)")
-        return size > 2000
+        if verbose: print(f"  [8] saved {size//1024} KB")
+        return size > 3000
 
     except Exception as e:
         if verbose: print(f"  [flow] ❌ {type(e).__name__}: {e}")
@@ -236,10 +235,22 @@ async def _run_flow(page, pnr_text: str, output_path: str, verbose: bool) -> boo
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Mode 1: Browserless.io
+# Browser launchers
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _via_browserless(pnr_text: str, output_path: str, verbose: bool) -> bool:
+def _ctx_opts():
+    return dict(
+        viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
+        device_scale_factor=2,
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    )
+
+
+async def _via_browserless(pnr_text, output_path, verbose):
     if not BROWSERLESS_TOKEN:
         return False
     try:
@@ -247,44 +258,29 @@ async def _via_browserless(pnr_text: str, output_path: str, verbose: bool) -> bo
     except ImportError:
         return False
 
-    for tmpl in BL_WSS_ENDPOINTS:
-        ws = tmpl.format(token=BROWSERLESS_TOKEN)
-        if verbose: print(f"  [browserless] thử: {ws[:60]}...")
+    for tmpl in BL_ENDPOINTS:
+        ws = tmpl.format(t=BROWSERLESS_TOKEN)
+        if verbose: print(f"  [BL] {ws[:55]}...")
         try:
             async with async_playwright() as pw:
-                browser = await pw.chromium.connect_over_cdp(ws, timeout=25_000)
-                ctx = await browser.new_context(
-                    viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
-                    device_scale_factor=2,
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    ),
-                )
+                browser = await pw.chromium.connect_over_cdp(ws, timeout=20_000)
+                ctx  = await browser.new_context(**_ctx_opts())
                 page = await ctx.new_page()
                 ok   = await _run_flow(page, pnr_text, output_path, verbose)
                 await browser.close()
                 if ok:
-                    if verbose: print(f"  [browserless] ✅ OK")
                     return True
         except Exception as e:
-            if verbose: print(f"  [browserless] ❌ {ws[:45]}: {e}")
-            continue
-
+            if verbose: print(f"  [BL] ❌ {e}")
     return False
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Mode 2: Playwright local
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def _via_playwright_local(pnr_text: str, output_path: str, verbose: bool) -> bool:
+async def _via_local(pnr_text, output_path, verbose):
     try:
         from playwright.async_api import async_playwright
     except ImportError:
         return False
-    if verbose: print("  [mode] Playwright local...")
+    if verbose: print("  [local] Playwright chromium...")
     try:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(
@@ -292,10 +288,7 @@ async def _via_playwright_local(pnr_text: str, output_path: str, verbose: bool) 
                 args=["--no-sandbox","--disable-setuid-sandbox",
                       "--disable-dev-shm-usage","--disable-gpu"],
             )
-            ctx  = await browser.new_context(
-                viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
-                device_scale_factor=2,
-            )
+            ctx  = await browser.new_context(**_ctx_opts())
             page = await ctx.new_page()
             ok   = await _run_flow(page, pnr_text, output_path, verbose)
             await browser.close()
@@ -306,74 +299,73 @@ async def _via_playwright_local(pnr_text: str, output_path: str, verbose: bool) 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Post-process PIL: crop Co2 còn sót + whitespace thừa ở đáy
+# Post-process: crop whitespace thừa ở đáy
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _postprocess(img_path: str, verbose: bool = False):
-    """Tự động crop vùng trắng thừa và dòng Co2 còn sót ở đáy."""
+def _trim_bottom(img_path: str, verbose=False):
     try:
         img = Image.open(img_path).convert("RGB")
         w, h = img.size
-
-        # Tìm y cuối cùng có nội dung thực (pixel không trắng/xám quá nhạt)
-        last_y = h
-        for y in range(h - 1, max(h - 100, 0), -1):
-            row = [img.getpixel((x, y)) for x in range(0, w, 6)]
-            non_bg = sum(
-                1 for r, g, b in row
-                if not (r > 235 and g > 235 and b > 235)   # không trắng
-                and not (r < 20  and g < 20  and b < 20)    # không đen thuần
+        # Scan từ đáy lên, tìm dòng cuối có nội dung thực
+        for y in range(h - 1, max(h - 120, 0), -1):
+            row = [img.getpixel((x, y)) for x in range(0, w, 8)]
+            # Pixel không phải trắng thuần và không phải đen thuần
+            active = sum(
+                1 for r,g,b in row
+                if not (r>240 and g>240 and b>240)
+                and not (r<15  and g<15  and b<15)
             )
-            if non_bg / len(row) > 0.04:
-                last_y = y + 4
-                break
-
-        if last_y < h - 2:
-            img.crop((0, 0, w, last_y)).save(img_path, "PNG")
-            if verbose: print(f"  [PIL] crop bottom: {h}→{last_y}px")
-
+            if active / len(row) > 0.03:
+                new_h = min(y + 20, h)
+                if new_h < h - 5:
+                    img.crop((0, 0, w, new_h)).save(img_path, "PNG")
+                    if verbose: print(f"  [trim] {h}→{new_h}px")
+                return
     except Exception as e:
-        if verbose: print(f"  [PIL] skip: {e}")
+        if verbose: print(f"  [trim] skip: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Public API
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _async_main(pnr_text: str, output_path: str, verbose: bool) -> str:
-    ok = False
+async def _main(pnr_text, output_path, verbose):
     if BROWSERLESS_TOKEN:
         ok = await _via_browserless(pnr_text, output_path, verbose)
-    if not ok:
-        ok = await _via_playwright_local(pnr_text, output_path, verbose)
-    if not ok:
-        raise RuntimeError(
-            "Không thể chụp ảnh.\n"
-            "• Local : python -m playwright install chromium\n"
-            "• Render: kiểm tra BROWSERLESS_TOKEN"
-        )
-    _postprocess(output_path, verbose)
-    return output_path
+        if ok and os.path.isfile(output_path) and os.path.getsize(output_path) > 3000:
+            _trim_bottom(output_path, verbose)
+            return output_path
+        if verbose: print("  Browserless fail → local...")
+
+    ok = await _via_local(pnr_text, output_path, verbose)
+    if ok and os.path.isfile(output_path) and os.path.getsize(output_path) > 3000:
+        _trim_bottom(output_path, verbose)
+        return output_path
+
+    raise RuntimeError(
+        "Không thể chụp ảnh PNR.\n"
+        "• Render: kiểm tra BROWSERLESS_TOKEN\n"
+        "• Local : python -m playwright install chromium"
+    )
 
 
 def pnr_to_image(pnr_text: str, output_path: str = None, verbose: bool = False) -> str:
-    if output_path is None:
+    if not output_path:
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        output_path = tmp.name
-        tmp.close()
-    asyncio.run(_async_main(pnr_text, output_path, verbose))
+        output_path = tmp.name; tmp.close()
+    asyncio.run(_main(pnr_text, output_path, verbose))
     return output_path
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import argparse, sys as _sys
-    p = argparse.ArgumentParser(description="PNR → pnrexpert.com → PNG (full content)")
+    import argparse, sys
+    p = argparse.ArgumentParser()
     p.add_argument("pnr", nargs="?")
     p.add_argument("-o", "--output", default="pnr_result.png")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
-    pnr = args.pnr or _sys.stdin.read()
-    print(f"🔄 Xử lý PNR (browserless={'có' if BROWSERLESS_TOKEN else 'không'})...")
-    out = pnr_to_image(pnr.strip(), args.output, args.verbose)
-    print(f"✅ Xong: {out}  ({os.path.getsize(out)//1024} KB)")
+    txt = args.pnr or sys.stdin.read()
+    print(f"🔄 Xử lý... (Browserless: {'✅' if BROWSERLESS_TOKEN else '❌ local'})")
+    out = pnr_to_image(txt.strip(), args.output, args.verbose)
+    print(f"✅ {out}  ({os.path.getsize(out)//1024} KB)")
