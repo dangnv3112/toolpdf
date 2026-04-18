@@ -267,12 +267,28 @@ async def _run_flow(page, pnr_text: str, output_path: str, verbose: bool) -> boo
         await page.evaluate(JS_REMOVE_OVERFLOW, info)
         await asyncio.sleep(0.3)
 
-        # 8. Tính clip — dùng scrollH (chiều cao thực, không bị cắt)
-        PAD = 10
-        x   = max(0, info["x"] - PAD)
-        y   = max(0, info["y"] - PAD)
-        w   = min(VIEWPORT_W - x, info["w"] + PAD * 2)
-        h   = info["scrollH"] + PAD * 2
+        # 7b. Scroll về top để y-coordinate khớp với viewport
+        await page.evaluate("() => window.scrollTo(0, 0)")
+        await asyncio.sleep(0.2)
+
+        # 7c. Lấy lại tọa độ sau scroll (getBoundingClientRect thay đổi theo scroll)
+        info = await page.evaluate(JS_FIND_RESULT)
+        if not info:
+            if verbose: print("  [7c] ⚠️ mất info sau scroll — chụp full page")
+            await page.screenshot(path=output_path, full_page=True)
+            return os.path.getsize(output_path) > 5000
+        if verbose: print(f"  [7c] info sau scroll: {info}")
+
+        # 8. Tính clip — PAD_TOP lớn hơn để không cắt phần đầu "Outbound / Return"
+        PAD_X   = 10
+        PAD_TOP = 30   # đủ rộng để giữ header Outbound/Return
+        PAD_BOT = 20
+
+        x = max(0, info["x"] - PAD_X)
+        y = max(0, info["y"] - PAD_TOP)
+        w = min(VIEWPORT_W - x, info["w"] + PAD_X * 2)
+        # Dùng max(scrollH, h) phòng trường hợp scrollH < chiều cao thực
+        h = max(info["scrollH"], info["h"]) + PAD_TOP + PAD_BOT
 
         clip = {"x": x, "y": y, "width": w, "height": h}
         if verbose: print(f"  [8] clip: {clip}")
