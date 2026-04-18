@@ -50,6 +50,16 @@ try:
 except ImportError as e:
     sys.exit(f"❌ Không import được icago_itinerary: {e}")
 
+# ── Word (.docx) converter ─────────────────────────────────────────────────────
+try:
+    from icago_word import convert_docx
+    DOCX_ENABLED = True
+    log.info("DOCX converter: ✅ enabled")
+except ImportError:
+    DOCX_ENABLED = False
+    convert_docx = None
+    log.info("DOCX converter: ⚠️ disabled (icago_word.py không tìm thấy)")
+
 # ── PNR screenshot (không bắt buộc) ───────────────────────────────────────────
 try:
     from pnr_screenshot import pnr_to_image
@@ -162,6 +172,8 @@ HELP_TEXT = (
     "📖 *ICAGO Bot — Hướng dẫn*\n\n"
     "📎 *Gửi file PDF* lịch trình GDS/Amadeus\n"
     "→ Nhận PDF chuẩn ICAGO (logo, bold, bỏ rác)\n\n"
+    "📝 *Gửi file Word (.docx)* lịch trình\n"
+    "→ Nhận PDF chuẩn ICAGO (bỏ logo cũ, thêm ICAGO logo)\n\n"
     + (
         "✈️ *Gửi mã PNR* (text từ GDS)\n"
         "→ Nhận ảnh lịch trình từ pnrexpert.com\n\n"
@@ -185,15 +197,23 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
-    if not doc.file_name.lower().endswith(".pdf"):
-        await update.message.reply_text("❌ Vui lòng gửi file *PDF*.", parse_mode="Markdown")
+    fname_lower = doc.file_name.lower()
+    is_pdf  = fname_lower.endswith(".pdf")
+    is_docx = fname_lower.endswith(".docx")
+
+    if not is_pdf and not is_docx:
+        await update.message.reply_text("❌ Vui lòng gửi file *PDF* hoặc *Word (.docx)*.", parse_mode="Markdown")
+        return
+    if is_docx and not DOCX_ENABLED:
+        await update.message.reply_text("⚠️ Tính năng Word chưa sẵn sàng (thiếu icago_word.py).")
         return
     if doc.file_size > MAX_MB * 1024 * 1024:
         await update.message.reply_text(f"❌ File quá lớn (tối đa {MAX_MB} MB).")
         return
 
-    status = await update.message.reply_text("⏳ Đang xử lý PDF...")
-    log.info(f"PDF: {doc.file_name} từ {update.effective_user.full_name}")
+    file_type = "Word (.docx)" if is_docx else "PDF"
+    status = await update.message.reply_text(f"⏳ Đang xử lý {file_type}...")
+    log.info(f"{file_type}: {doc.file_name} từ {update.effective_user.full_name}")
 
     try:
         # Tạo TempDir và giữ nó sống (không dùng `with` vì cần đợi user rename)
@@ -201,13 +221,18 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tmp_obj = _tf.TemporaryDirectory()
         tmp = tmp_obj.name
 
-        inp  = os.path.join(tmp, "input.pdf")
+        ext_in   = ".docx" if is_docx else ".pdf"
+        inp      = os.path.join(tmp, f"input{ext_in}")
         default_name = Path(doc.file_name).stem + "_ICAGO.pdf"
-        out  = os.path.join(tmp, default_name)
+        out      = os.path.join(tmp, default_name)
 
         tgf = await ctx.bot.get_file(doc.file_id)
         await tgf.download_to_drive(inp)
-        convert(inp, out, logo_path=LOGO_PATH, luuy_path=LUUY_PATH)
+
+        if is_docx:
+            convert_docx(inp, out, logo_path=LOGO_PATH, luuy_path=LUUY_PATH)
+        else:
+            convert(inp, out, logo_path=LOGO_PATH, luuy_path=LUUY_PATH)
 
         user_id = update.effective_user.id
         _pending_pdf[user_id]  = {"out": out, "default_name": default_name}

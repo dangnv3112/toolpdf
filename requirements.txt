@@ -13,3 +13,4 @@ gunicorn>=21.0.0
 
 # Self-ping (giữ Render không sleep)
 requests>=2.31.0
+python-docx>=0.8.11
