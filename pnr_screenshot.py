@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 pnr_screenshot.py — PNR Expert Auto Screenshot
-Chụp đúng khung kết quả từ pnrexpert.com — nhanh, không timeout.
+Chụp đúng phần nội dung (Outbound→Return→Ticket) từ pnrexpert.com.
 """
 
 import asyncio
@@ -16,7 +16,7 @@ except ImportError:
 # ── Config ─────────────────────────────────────────────────────────────────────
 PNR_URL           = "https://www.pnrexpert.com/"
 VIEWPORT_W        = 1280
-VIEWPORT_H        = 3000   # cao ngay từ đầu → không cần resize sau
+VIEWPORT_H        = 3000
 BROWSERLESS_TOKEN = os.environ.get("BROWSERLESS_TOKEN", "").strip()
 
 BL_ENDPOINTS = [
@@ -26,18 +26,28 @@ BL_ENDPOINTS = [
     "wss://chrome.browserless.io?token={t}",
 ]
 
-# ── JS: ẩn Co2 ─────────────────────────────────────────────────────────────────
-JS_HIDE_CO2 = r"""() => {
+# ── JS: tắt animation ──────────────────────────────────────────────────────────
+JS_NO_ANIM = r"""() => {
+    const s = document.createElement('style');
+    s.textContent = '*{animation:none!important;transition:none!important;}';
+    document.head.appendChild(s);
+}"""
+
+# ── JS: ẩn Co2 + các dòng rác TRƯỚC khi tìm bounding box ─────────────────────
+# Ẩn trước để không tính vào chiều cao clip
+JS_HIDE_JUNK = r"""() => {
     let n = 0;
     document.querySelectorAll('*').forEach(el => {
-        if (el.children.length === 0 &&
-            /tonnes?\s+of\s+co2/i.test(el.textContent || '')) {
+        if (el.children.length > 0) return;
+        const txt = el.textContent || '';
+        // Ẩn dòng Co2
+        if (/tonnes?\s+of\s+co2/i.test(txt)) {
             let cur = el;
             for (let i = 0; i < 6 && cur && cur !== document.body; i++) {
-                if (/tonnes?\s+of\s+co2/i.test(cur.innerText || '') &&
-                    !/depart|arriv|flight|outbound|return/i.test(cur.innerText || '')) {
-                    cur.style.display = 'none';
-                    n++; break;
+                const t = cur.innerText || '';
+                if (/tonnes?\s+of\s+co2/i.test(t) &&
+                    !/depart|arriv|flight|outbound|return/i.test(t)) {
+                    cur.style.display = 'none'; n++; break;
                 }
                 cur = cur.parentElement;
             }
@@ -46,169 +56,76 @@ JS_HIDE_CO2 = r"""() => {
     return n;
 }"""
 
-# ── JS: tắt animation ──────────────────────────────────────────────────────────
-JS_NO_ANIM = r"""() => {
-    const s = document.createElement('style');
-    s.textContent = '*{animation:none!important;transition:none!important;}';
-    document.head.appendChild(s);
-}"""
-
-# ── JS chính: tìm ĐÚNG phần nội dung bảng chuyến bay (bên dưới toolbar) ──────
-# pnrexpert.com có cấu trúc: [toolbar buttons] → [bảng nội dung trắng]
-# Phải lấy phần nội dung (bảng trắng), KHÔNG lấy wrapper bao cả toolbar.
+# ── JS chính: tìm clip box chính xác ──────────────────────────────────────────
+# Thuật toán:
+#   1. Tìm text node "Outbound" (header đầu tiên của bảng kết quả)
+#   2. Tìm text node cuối cùng trong bảng (FLIGHT TICKET hoặc dòng cuối Return)
+#   3. Tính bounding box bao trùm từ đầu đến cuối
+#   4. Fallback: lấy element cha chứa cả Outbound và Return
 JS_FIND_RESULT = r"""() => {
-    // ── Chiến lược 1: Tìm phần tử chứa nội dung bảng bên dưới toolbar ─────────
-    // pnrexpert render nội dung vào một div có bg trắng, chứa table với
-    // thông tin DEPARTURE/ARRIVAL/Outbound/Return
-    const flightKeywords = /departs?:|arrives?:|outbound|return.*(?:city|airport)|duration:/i;
+    // Scroll về top trước
+    window.scrollTo(0, 0);
 
-    // Tìm tất cả div/section có chứa nội dung chuyến bay thực sự
-    const candidates = Array.from(document.querySelectorAll('div, section, table'))
-        .filter(el => {
-            const txt = el.innerText || '';
-            if (!flightKeywords.test(txt)) return false;
-            const r = el.getBoundingClientRect();
-            // Phải có kích thước hợp lý và nằm trong viewport
-            if (r.width < 300 || r.height < 100) return false;
-            // Loại bỏ body và các container cực lớn bao cả trang
-            if (r.width > window.innerWidth * 0.98 && r.height > window.innerHeight * 1.5) return false;
-            return true;
-        })
-        .map(el => {
-            const r = el.getBoundingClientRect();
-            const txt = el.innerText || '';
-            // Ưu tiên element nhỏ nhất vừa đủ chứa nội dung (tránh lấy wrapper to)
-            // Tính điểm: nhiều keyword = tốt, diện tích nhỏ = tốt
-            const keyCount = (txt.match(/departs?:|arrives?:|duration:|outbound|return/gi) || []).length;
-            const area = r.width * r.height;
-            return { el, r, keyCount, area, scrollH: el.scrollHeight };
-        })
-        .filter(c => c.keyCount >= 2)
-        .sort((a, b) => {
-            // Ưu tiên: nhiều keyword hơn, diện tích nhỏ hơn
-            if (b.keyCount !== a.keyCount) return b.keyCount - a.keyCount;
-            return a.area - b.area;
-        });
-
-    if (candidates.length > 0) {
-        const best = candidates[0];
-        const r = best.r;
-        return {
-            strategy: 'flight-content-box',
-            x: Math.round(r.left), y: Math.round(r.top),
-            w: Math.round(r.width), h: Math.round(r.height),
-            scrollH: best.scrollH,
-        };
-    }
-
-    // ── Chiến lược 2: Tìm toolbar "Copy to Clipboard" → lấy SIBLING sau nó ────
-    // Toolbar và nội dung thường là anh em (siblings), không phải cha-con
-    const copyBtn = Array.from(document.querySelectorAll('button, span, div'))
-        .find(el => /copy to clipboard/i.test(el.innerText || el.textContent || ''));
-
-    if (copyBtn) {
-        // Tìm toolbar wrapper (cha gần nhất của nút Copy)
-        let toolbar = copyBtn;
-        for (let i = 0; i < 5; i++) {
-            const p = toolbar.parentElement;
-            if (!p || p === document.body) break;
-            const pr = p.getBoundingClientRect();
-            // Toolbar thường hẹp (height < 100px)
-            if (pr.height < 120) { toolbar = p; continue; }
-            break;
-        }
-
-        // Tìm sibling TIẾP THEO của toolbar — đó là bảng nội dung
-        let sib = toolbar.nextElementSibling;
-        for (let i = 0; i < 6 && sib; i++) {
-            const r = sib.getBoundingClientRect();
-            const txt = sib.innerText || '';
-            if (r.width > 300 && r.height > 150 && flightKeywords.test(txt)) {
-                return {
-                    strategy: 'toolbar-next-sibling-' + i,
-                    x: Math.round(r.left), y: Math.round(r.top),
-                    w: Math.round(r.width), h: Math.round(r.height),
-                    scrollH: sib.scrollHeight,
-                };
-            }
-            sib = sib.nextElementSibling;
-        }
-
-        // Nếu không tìm được sibling, leo lên 1 cấp rồi thử lại
-        const toolbarParent = toolbar.parentElement;
-        if (toolbarParent) {
-            sib = toolbarParent.nextElementSibling;
-            for (let i = 0; i < 4 && sib; i++) {
-                const r = sib.getBoundingClientRect();
-                const txt = sib.innerText || '';
-                if (r.width > 300 && r.height > 150 && flightKeywords.test(txt)) {
-                    return {
-                        strategy: 'toolbar-parent-next-' + i,
-                        x: Math.round(r.left), y: Math.round(r.top),
-                        w: Math.round(r.width), h: Math.round(r.height),
-                        scrollH: sib.scrollHeight,
-                    };
-                }
-                sib = sib.nextElementSibling;
+    // ── Tìm element chứa "Outbound" (header section đầu tiên) ─────────────────
+    function findTextEl(regex) {
+        const walker = document.createTreeWalker(
+            document.body, NodeFilter.SHOW_TEXT, null, false
+        );
+        let node;
+        while ((node = walker.nextNode())) {
+            if (regex.test(node.textContent || '')) {
+                return node.parentElement;
             }
         }
+        return null;
     }
 
-    // ── Chiến lược 3: bg trắng + có chứa table chuyến bay ────────────────────
-    const whiteBoxes = Array.from(document.querySelectorAll('div'))
-        .filter(el => {
-            const style = window.getComputedStyle(el);
-            const bg = style.backgroundColor;
-            const isWhite = bg === 'rgb(255, 255, 255)' || bg === 'rgba(0, 0, 0, 0)';
-            if (!isWhite) return false;
-            const r = el.getBoundingClientRect();
-            if (r.width < 400 || r.height < 200) return false;
-            const txt = el.innerText || '';
-            return flightKeywords.test(txt);
-        })
-        .map(el => {
-            const r = el.getBoundingClientRect();
-            return { el, r, scrollH: el.scrollHeight, area: r.width * r.height };
-        })
-        .sort((a, b) => a.area - b.area);
+    const outboundEl = findTextEl(/outbound\s*:/i) || findTextEl(/outbound/i);
+    const returnEl   = findTextEl(/return\s*:/i)   || findTextEl(/\breturn\b/i);
 
-    if (whiteBoxes.length > 0) {
-        const best = whiteBoxes[0];
-        const r = best.r;
-        return {
-            strategy: 'white-box',
-            x: Math.round(r.left), y: Math.round(r.top),
-            w: Math.round(r.width), h: Math.round(r.height),
-            scrollH: best.scrollH,
-        };
-    }
+    if (!outboundEl) return null;
 
-    return null;
-}"""
-
-# ── JS: bỏ overflow để hiện full nội dung ─────────────────────────────────────
-JS_REMOVE_OVERFLOW = r"""(selector_info) => {
-    // Tìm lại element theo tọa độ và bỏ overflow
-    if (!selector_info) return 0;
-    const { x, y, w } = selector_info;
-    const el = document.elementFromPoint(x + w/2, y + 10);
-    if (!el) return 0;
-    
-    let cur = el;
-    for (let i = 0; i < 10; i++) {
-        if (!cur || cur === document.body) break;
-        const r = cur.getBoundingClientRect();
-        if (r.width > 300 && cur.scrollHeight > 200) {
-            const style = window.getComputedStyle(cur);
-            if (style.overflow !== 'visible' || style.overflowY !== 'visible') {
-                cur.style.overflow = 'visible';
-                cur.style.maxHeight = 'none';
-                cur.style.height = 'auto';
-            }
+    // ── Tìm container cha nhỏ nhất bao cả Outbound + Return ───────────────────
+    function getContainer(elA, elB) {
+        if (!elB) return elA;
+        // Leo lên từ elA cho đến khi container đó chứa cả elB
+        let cur = elA;
+        for (let i = 0; i < 15 && cur && cur !== document.body; i++) {
+            if (cur.contains(elB)) return cur;
+            cur = cur.parentElement;
         }
+        return elA;
+    }
+
+    const container = getContainer(outboundEl, returnEl);
+    if (!container) return null;
+
+    const r = container.getBoundingClientRect();
+
+    // Kiểm tra hợp lệ
+    if (r.width < 200 || r.height < 100) return null;
+
+    // Bỏ overflow để render full nội dung
+    let cur = container;
+    for (let i = 0; i < 10 && cur && cur !== document.body; i++) {
+        cur.style.overflow  = 'visible';
+        cur.style.maxHeight = 'none';
+        cur.style.height    = 'auto';
         cur = cur.parentElement;
     }
-    return 1;
+
+    // Lấy lại r sau khi bỏ overflow
+    const r2 = container.getBoundingClientRect();
+
+    return {
+        strategy: 'outbound-return-container',
+        x: Math.round(r2.left),
+        y: Math.round(r2.top),
+        w: Math.round(r2.width),
+        h: Math.round(r2.height),
+        scrollH: container.scrollHeight,
+        elTag: container.tagName,
+    };
 }"""
 
 
@@ -218,10 +135,9 @@ JS_REMOVE_OVERFLOW = r"""(selector_info) => {
 
 async def _run_flow(page, pnr_text: str, output_path: str, verbose: bool) -> bool:
     try:
-        # 1. Mở trang — chỉ chờ DOMContentLoaded (nhanh hơn networkidle)
+        # 1. Mở trang
         if verbose: print("  [1] goto pnrexpert.com...")
         await page.goto(PNR_URL, timeout=25_000, wait_until="domcontentloaded")
-        # Chờ textarea xuất hiện thay vì networkidle
         await page.wait_for_selector("textarea", timeout=10_000)
 
         # 2. Paste PNR
@@ -234,69 +150,54 @@ async def _run_flow(page, pnr_text: str, output_path: str, verbose: bool) -> boo
         if verbose: print("  [3] Quick Convert...")
         await page.locator("button:has-text('Quick Convert')").click()
 
-        # 4. Chờ kết quả — dùng wait_for_selector thay vì wait_for_function
+        # 4. Chờ kết quả render
         if verbose: print("  [4] chờ kết quả...")
         try:
-            # Chờ element có text "Departs" hoặc "Outbound" → kết quả đã render
             await page.wait_for_function(
-                r"() => document.body.innerText.includes('Departs') || "
-                r"      document.body.innerText.includes('Outbound')",
-                timeout=20_000,
-                polling=500,   # check mỗi 500ms thay vì default 100ms
+                r"() => /outbound/i.test(document.body.innerText) || "
+                r"      /departs/i.test(document.body.innerText)",
+                timeout=20_000, polling=500,
             )
             if verbose: print("  [4] ✅ kết quả đã hiện")
         except Exception:
-            if verbose: print("  [4] ⚠️ timeout — thử chụp")
-        await asyncio.sleep(1)   # buffer nhỏ để render xong
+            if verbose: print("  [4] ⚠️ timeout — thử tiếp")
+        await asyncio.sleep(1)
 
-        # 5. Tắt animation + ẩn Co2
+        # 5. Tắt animation
         await page.evaluate(JS_NO_ANIM)
-        n = await page.evaluate(JS_HIDE_CO2)
-        if verbose: print(f"  [5] ẩn {n} Co2 element")
 
-        # 6. Tìm khung kết quả
-        info = await page.evaluate(JS_FIND_RESULT)
-        if verbose: print(f"  [6] result box: {info}")
+        # 6. ẨN CO2 + JUNK TRƯỚC — để không tính vào bounding box
+        n = await page.evaluate(JS_HIDE_JUNK)
+        if verbose: print(f"  [6] ẩn {n} junk element")
+        await asyncio.sleep(0.2)  # chờ layout reflow sau khi ẩn
 
-        if not info:
-            if verbose: print("  [6] ⚠️ không tìm thấy khung — chụp full page")
-            await page.screenshot(path=output_path, full_page=True)
-            return os.path.getsize(output_path) > 5000
-
-        # 7. Bỏ overflow để nội dung không bị cắt
-        await page.evaluate(JS_REMOVE_OVERFLOW, info)
-        await asyncio.sleep(0.3)
-
-        # 7b. Scroll về top để y-coordinate khớp với viewport
+        # 7. Scroll về top
         await page.evaluate("() => window.scrollTo(0, 0)")
         await asyncio.sleep(0.2)
 
-        # 7c. Lấy lại tọa độ sau scroll (getBoundingClientRect thay đổi theo scroll)
+        # 8. Tìm clip box
         info = await page.evaluate(JS_FIND_RESULT)
+        if verbose: print(f"  [8] result box: {info}")
+
         if not info:
-            if verbose: print("  [7c] ⚠️ mất info sau scroll — chụp full page")
+            if verbose: print("  [8] ⚠️ không tìm thấy — chụp full page")
             await page.screenshot(path=output_path, full_page=True)
             return os.path.getsize(output_path) > 5000
-        if verbose: print(f"  [7c] info sau scroll: {info}")
 
-        # 8. Tính clip — PAD_TOP lớn hơn để không cắt phần đầu "Outbound / Return"
-        PAD_X   = 10
-        PAD_TOP = 30   # đủ rộng để giữ header Outbound/Return
-        PAD_BOT = 20
-
-        x = max(0, info["x"] - PAD_X)
-        y = max(0, info["y"] - PAD_TOP)
-        w = min(VIEWPORT_W - x, info["w"] + PAD_X * 2)
-        # Dùng max(scrollH, h) phòng trường hợp scrollH < chiều cao thực
-        h = max(info["scrollH"], info["h"]) + PAD_TOP + PAD_BOT
+        # 9. Tính clip — padding nhỏ và đều
+        PAD = 12
+        x = max(0, info["x"] - PAD)
+        y = max(0, info["y"] - PAD)
+        w = min(VIEWPORT_W - x, info["w"] + PAD * 2)
+        h = max(info["scrollH"], info["h"]) + PAD * 2
 
         clip = {"x": x, "y": y, "width": w, "height": h}
-        if verbose: print(f"  [8] clip: {clip}")
+        if verbose: print(f"  [9] clip: {clip}")
 
         await page.screenshot(path=output_path, clip=clip, full_page=False)
 
         size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
-        if verbose: print(f"  [8] saved {size//1024} KB")
+        if verbose: print(f"  [9] saved {size//1024} KB")
         return size > 3000
 
     except Exception as e:
@@ -376,10 +277,8 @@ def _trim_bottom(img_path: str, verbose=False):
     try:
         img = Image.open(img_path).convert("RGB")
         w, h = img.size
-        # Scan từ đáy lên, tìm dòng cuối có nội dung thực
         for y in range(h - 1, max(h - 120, 0), -1):
             row = [img.getpixel((x, y)) for x in range(0, w, 8)]
-            # Pixel không phải trắng thuần và không phải đen thuần
             active = sum(
                 1 for r,g,b in row
                 if not (r>240 and g>240 and b>240)
