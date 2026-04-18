@@ -1,62 +1,46 @@
 #!/usr/bin/env python3
 """
 pnr_screenshot.py — PNR Expert Auto Screenshot
-================================================
-Nhận mã PNR → dán vào pnrexpert.com → Quick Convert → chụp ảnh kết quả
-(tự động ẩn dòng "Tonnes of Co2")
-
-Hỗ trợ 3 mode (tự động chọn theo môi trường):
-  1. Browserless.io  — dùng khi có BROWSERLESS_TOKEN (Render deploy)
-  2. Playwright local — dùng khi đã cài chromium (chạy local)
-  3. Selenium local  — fallback nếu có Chrome/chromedriver
-
-Cài đặt local:
-  pip install playwright pillow requests
-  python -m playwright install chromium
-
-Deploy Render (không cần cài Chrome):
-  - Đăng ký https://browserless.io (free: 1000 sessions/month)
-  - Set env: BROWSERLESS_TOKEN=your_token
-  - KHÔNG cần cài playwright trên Render
-
-Dùng từ code khác:
-  from pnr_screenshot import pnr_to_image
-  img_path = pnr_to_image("1.SMITH/JOHN ...", output_path="result.png")
+Chụp đúng khung kết quả (dark preview panel) — full height, không bị cắt.
 """
 
 import asyncio
-import base64
-import json
 import os
-import re
+import sys
 import tempfile
-from pathlib import Path
 
 try:
-    from PIL import Image, ImageChops
-    import io as _io
+    from PIL import Image
 except ImportError:
     raise SystemExit("❌ pip install pillow")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-PNR_URL            = "https://www.pnrexpert.com/"
-VIEWPORT_W         = 1200
-VIEWPORT_H         = 900
-BROWSERLESS_TOKEN  = os.environ.get("BROWSERLESS_TOKEN", "")
-BROWSERLESS_WS     = "wss://chrome.browserless.io?token={token}&--window-size={w},{h}"
+PNR_URL           = "https://www.pnrexpert.com/"
+VIEWPORT_W        = 1280
+VIEWPORT_H        = 900
+BROWSERLESS_TOKEN = os.environ.get("BROWSERLESS_TOKEN", "").strip()
 
-# JS: ẩn dòng Co2 + animation, trả về số element đã ẩn
+BL_WSS_ENDPOINTS = [
+    "wss://production-sfo.browserless.io?token={token}&launch=%7B%22stealth%22%3Atrue%7D",
+    "wss://production-sfo.browserless.io?token={token}",
+    "wss://production-lon.browserless.io?token={token}",
+    "wss://chrome.browserless.io?token={token}",
+]
+
+# ── JS: ẩn Co2 ─────────────────────────────────────────────────────────────────
 JS_HIDE_CO2 = r"""
 () => {
     let count = 0;
     document.querySelectorAll('*').forEach(el => {
-        const txt = (el.innerText || el.textContent || '');
+        const txt = el.innerText || el.textContent || '';
         if (/tonnes?\s+of\s+co2/i.test(txt) && el.children.length === 0) {
             let cur = el;
-            while (cur && cur !== document.body) {
-                const t = (cur.innerText || '');
-                if (/tonnes?\s+of\s+co2/i.test(t) && !/depart|arriv|flight/i.test(t)) {
-                    cur.style.cssText += 'display:none!important;visibility:hidden!important;';
+            for (let i = 0; i < 6; i++) {
+                if (!cur || cur === document.body) break;
+                const t = cur.innerText || '';
+                if (/tonnes?\s+of\s+co2/i.test(t) &&
+                    !/depart|arriv|flight|outbound|return/i.test(t)) {
+                    cur.style.cssText += 'display:none!important;';
                     count++;
                     break;
                 }
@@ -64,289 +48,332 @@ JS_HIDE_CO2 = r"""
             }
         }
     });
-    // Tắt animation để chụp ảnh sắc nét
-    const style = document.createElement('style');
-    style.textContent = '* { animation: none !important; transition: none !important; }';
-    document.head.appendChild(style);
+    const s = document.createElement('style');
+    s.textContent = '*{animation:none!important;transition:none!important;}';
+    document.head && document.head.appendChild(s);
     return count;
 }
 """
 
-# JS: tìm bounding box vùng kết quả
-JS_GET_BBOX = r"""
+# ── JS: tìm ĐÚNG khung preview kết quả (dark panel) ──────────────────────────
+JS_FIND_PREVIEW = r"""
 () => {
-    const candidates = [
-        '.itinerary-preview', '.itinerary-output', '.result-preview',
-        '[class*="preview"]', '[class*="itinerary"]', '[class*="result-area"]',
-        '.card', '[class*="output"]',
-    ];
-    for (const sel of candidates) {
-        for (const el of document.querySelectorAll(sel)) {
+    // pnrexpert.com: khung kết quả là div scrollable chứa nội dung chuyến bay
+    // Thường có class chứa "preview", "output", "result", hoặc có background tối
+
+    const flightKeywords = /departs?|arrives?|outbound|return.*city|flight itinerary/i;
+
+    // Ưu tiên 1: tìm element scrollable (overflow) chứa nội dung flight
+    const allEls = Array.from(document.querySelectorAll('div, section, article'));
+    
+    // Sắp xếp theo diện tích lớn nhất trước
+    const candidates = allEls
+        .map(el => {
             const r = el.getBoundingClientRect();
-            if (r.width > 400 && r.height > 150) {
-                return { x: Math.round(r.x), y: Math.round(r.y),
-                         w: Math.round(r.width), h: Math.round(r.height), sel };
-            }
-        }
-    }
-    // Fallback: tìm element chứa "Departs"
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
-    while (walker.nextNode()) {
-        const el = walker.currentNode;
-        if (/departs?:/i.test(el.innerText || '') && el.children.length > 2) {
+            const txt = el.innerText || '';
+            const hasContent = flightKeywords.test(txt);
+            const isScrollable = el.scrollHeight > el.clientHeight + 10;
+            const isLarge = r.width > 300 && r.height > 100;
+            return { el, r, txt, hasContent, isScrollable, isLarge,
+                     score: (hasContent ? 10 : 0) + (isScrollable ? 5 : 0) + (isLarge ? 3 : 0) };
+        })
+        .filter(c => c.hasContent && c.isLarge)
+        .sort((a, b) => b.score - a.score || b.r.width * b.r.height - a.r.width * a.r.height);
+
+    if (candidates.length === 0) return null;
+
+    const best = candidates[0];
+    const el   = best.el;
+    const r    = best.r;
+
+    // Lấy scrollHeight thực sự (full height kể cả phần bị cắt)
+    return {
+        x:            Math.round(r.left),
+        y:            Math.round(r.top),
+        w:            Math.round(r.width),
+        h_visible:    Math.round(r.height),        // chiều cao nhìn thấy
+        h_full:       el.scrollHeight,             // chiều cao thực (full)
+        scrollable:   el.scrollHeight > el.clientHeight + 10,
+        tag:          el.tagName,
+        className:    el.className.toString().slice(0, 80),
+    };
+}
+"""
+
+# ── JS: scroll element về top và expand để lấy full height ───────────────────
+JS_EXPAND_AND_RESET = r"""
+() => {
+    // Tìm lại element và:
+    // 1. Bỏ overflow hidden/scroll để nội dung hiện full
+    // 2. Scroll về đầu
+    const flightKeywords = /departs?|arrives?|outbound|return.*city|flight itinerary/i;
+    const allEls = Array.from(document.querySelectorAll('div, section, article'));
+    
+    const candidates = allEls
+        .filter(el => {
+            const txt = el.innerText || '';
             const r = el.getBoundingClientRect();
-            if (r.width > 300 && r.height > 100) {
-                return { x: Math.round(r.x), y: Math.round(r.y),
-                         w: Math.round(r.width), h: Math.round(r.height), sel: 'departs-fallback' };
-            }
-        }
-    }
-    return null;
+            return flightKeywords.test(txt) && r.width > 300 && r.height > 100;
+        })
+        .sort((a, b) => {
+            const ra = a.getBoundingClientRect();
+            const rb = b.getBoundingClientRect();
+            return (rb.width * rb.height) - (ra.width * ra.height);
+        });
+
+    if (candidates.length === 0) return 0;
+
+    const el = candidates[0];
+    // Bỏ giới hạn height và overflow để nội dung hiện đầy đủ
+    el.style.cssText += `
+        overflow: visible !important;
+        max-height: none !important;
+        height: auto !important;
+    `;
+    el.scrollTop = 0;
+    
+    // Làm tương tự các con trực tiếp
+    Array.from(el.children).forEach(child => {
+        child.style.cssText += 'overflow: visible !important; max-height: none !important;';
+    });
+
+    return el.scrollHeight;
 }
 """
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Mode 1: Browserless.io (Render deploy — không cần cài Chrome)
+# Core flow
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _via_browserless(pnr_text: str, output_path: str, verbose: bool) -> bool:
+async def _run_flow(page, pnr_text: str, output_path: str, verbose: bool) -> bool:
     """
-    Dùng Playwright kết nối tới Browserless.io qua WebSocket.
-    Không cần Chrome cài local.
-    Trả về True nếu thành công.
+    Paste PNR → Quick Convert → chờ kết quả → ẩn Co2
+    → chụp ĐÚNG khung kết quả full height.
     """
-    try:
-        from playwright.async_api import async_playwright, TimeoutError as PWTimeout
-    except ImportError:
-        if verbose: print("  [browserless] playwright không có — bỏ qua mode này")
-        return False
-
-    if not BROWSERLESS_TOKEN:
-        return False
-
-    ws_url = BROWSERLESS_WS.format(
-        token=BROWSERLESS_TOKEN, w=VIEWPORT_W, h=VIEWPORT_H
-    )
-    if verbose: print(f"  [browserless] kết nối tới browserless.io...")
-
-    try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.connect_over_cdp(ws_url)
-            context = await browser.new_context(
-                viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
-                device_scale_factor=2,
-            )
-            page = await context.new_page()
-            result = await _run_pnr_flow(page, pnr_text, output_path, verbose)
-            await browser.close()
-            return result
-    except Exception as e:
-        if verbose: print(f"  [browserless] lỗi: {e}")
-        return False
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Mode 2: Playwright local (chạy local sau khi cài chromium)
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def _via_playwright_local(pnr_text: str, output_path: str, verbose: bool) -> bool:
-    try:
-        from playwright.async_api import async_playwright, TimeoutError as PWTimeout
-    except ImportError:
-        if verbose: print("  [playwright] không cài — bỏ qua")
-        return False
-
-    if verbose: print("  [playwright] khởi động Chrome local...")
-    try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox",
-                      "--disable-dev-shm-usage", "--disable-gpu"],
-            )
-            context = await browser.new_context(
-                viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
-                device_scale_factor=2,
-            )
-            page = await context.new_page()
-            result = await _run_pnr_flow(page, pnr_text, output_path, verbose)
-            await browser.close()
-            return result
-    except Exception as e:
-        if verbose: print(f"  [playwright] lỗi: {e}")
-        return False
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Flow chung: paste PNR → Quick Convert → screenshot
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def _run_pnr_flow(page, pnr_text: str, output_path: str, verbose: bool) -> bool:
-    try:
-        from playwright.async_api import TimeoutError as PWTimeout
-    except ImportError:
-        return False
-
-    PAD = 24  # pixel padding quanh vùng kết quả
-
     try:
         # 1. Mở trang
-        if verbose: print("  [flow] mở pnrexpert.com...")
+        if verbose: print("  [flow] mở pnrexpert.com ...")
         await page.goto(PNR_URL, timeout=30_000, wait_until="domcontentloaded")
-        await page.wait_for_load_state("networkidle", timeout=20_000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15_000)
+        except Exception:
+            pass
 
         # 2. Paste PNR
         if verbose: print("  [flow] paste PNR...")
         ta = await page.wait_for_selector("textarea", timeout=10_000)
         await ta.click()
         await ta.fill(pnr_text.strip())
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.5)
 
-        # 3. Click Quick Convert
-        if verbose: print("  [flow] Quick Convert...")
+        # 3. Quick Convert
+        if verbose: print("  [flow] click Quick Convert...")
         btn = await page.wait_for_selector(
             "button:has-text('Quick Convert')", timeout=10_000
         )
         await btn.click()
 
-        # 4. Chờ kết quả
+        # 4. Chờ nội dung flight xuất hiện
         if verbose: print("  [flow] chờ kết quả...")
         try:
             await page.wait_for_function(
-                "() => /departs?:/i.test(document.body.innerText)",
-                timeout=20_000,
+                r"() => /departs?:/i.test(document.body.innerText)",
+                timeout=25_000,
             )
-        except PWTimeout:
+        except Exception:
             if verbose: print("  [flow] ⚠️ timeout — tiếp tục")
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(2.5)  # buffer để render xong
 
         # 5. Ẩn Co2
         n = await page.evaluate(JS_HIDE_CO2)
         if verbose: print(f"  [flow] ẩn {n} phần tử Co2")
-        await asyncio.sleep(0.3)
 
-        # 6. Chụp ảnh
-        bbox = await page.evaluate(JS_GET_BBOX)
-        if verbose: print(f"  [flow] bbox: {bbox}")
+        # 6. Expand overflow + scroll top để lấy full height
+        full_h = await page.evaluate(JS_EXPAND_AND_RESET)
+        if verbose: print(f"  [flow] scrollHeight sau expand = {full_h}px")
+        await asyncio.sleep(0.5)
 
-        if bbox:
-            clip = {
-                "x":      max(0, bbox["x"] - PAD),
-                "y":      max(0, bbox["y"] - PAD),
-                "width":  min(VIEWPORT_W, bbox["w"] + PAD * 2),
-                "height": bbox["h"] + PAD * 2,
-            }
+        # 7. Tìm bounding box khung kết quả
+        info = await page.evaluate(JS_FIND_PREVIEW)
+        if verbose: print(f"  [flow] preview info = {info}")
+
+        if info and info.get("w", 0) > 200:
+            x        = max(0, info["x"] - 4)
+            y        = max(0, info["y"] - 4)
+            width    = min(VIEWPORT_W - x, info["w"] + 8)
+            # Dùng scrollHeight (chiều cao thực) thay vì clientHeight (bị cắt)
+            height   = info["h_full"] + 8
+
+            # Phóng viewport cao hơn để chứa đủ nội dung
+            needed_h = int(y + height + 50)
+            if needed_h > VIEWPORT_H:
+                await page.set_viewport_size({"width": VIEWPORT_W, "height": needed_h})
+                await asyncio.sleep(0.3)
+                # Lấy lại bounding box sau khi resize
+                info2 = await page.evaluate(JS_FIND_PREVIEW)
+                if info2:
+                    x     = max(0, info2["x"] - 4)
+                    y     = max(0, info2["y"] - 4)
+                    width = min(VIEWPORT_W - x, info2["w"] + 8)
+
+            clip = {"x": x, "y": y, "width": width, "height": height}
+            if verbose: print(f"  [flow] clip = {clip}")
             await page.screenshot(path=output_path, clip=clip, full_page=False)
+
         else:
+            # Fallback: chụp full page
+            if verbose: print("  [flow] fallback: full_page screenshot")
             await page.screenshot(path=output_path, full_page=True)
 
-        if verbose: print(f"  [flow] ✅ screenshot: {output_path}")
-        return True
+        size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+        if verbose: print(f"  [flow] ✅ saved {output_path} ({size//1024} KB)")
+        return size > 2000
 
     except Exception as e:
-        if verbose: print(f"  [flow] lỗi: {e}")
+        if verbose: print(f"  [flow] ❌ {type(e).__name__}: {e}")
         return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Post-process: PIL crop dòng Co2 còn sót
+# Mode 1: Browserless.io
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _crop_co2(img_path: str, verbose: bool = False):
-    """
-    Crop bỏ dòng Co2 còn sót ở cuối ảnh bằng cách phân tích pixel.
-    Tìm dòng cuối cùng có màu sắc (text) và cắt ngay sau đó.
-    """
+async def _via_browserless(pnr_text: str, output_path: str, verbose: bool) -> bool:
+    if not BROWSERLESS_TOKEN:
+        return False
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return False
+
+    for tmpl in BL_WSS_ENDPOINTS:
+        ws = tmpl.format(token=BROWSERLESS_TOKEN)
+        if verbose: print(f"  [browserless] thử: {ws[:60]}...")
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.connect_over_cdp(ws, timeout=25_000)
+                ctx = await browser.new_context(
+                    viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
+                    device_scale_factor=2,
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                )
+                page = await ctx.new_page()
+                ok   = await _run_flow(page, pnr_text, output_path, verbose)
+                await browser.close()
+                if ok:
+                    if verbose: print(f"  [browserless] ✅ OK")
+                    return True
+        except Exception as e:
+            if verbose: print(f"  [browserless] ❌ {ws[:45]}: {e}")
+            continue
+
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Mode 2: Playwright local
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _via_playwright_local(pnr_text: str, output_path: str, verbose: bool) -> bool:
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return False
+    if verbose: print("  [mode] Playwright local...")
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox","--disable-setuid-sandbox",
+                      "--disable-dev-shm-usage","--disable-gpu"],
+            )
+            ctx  = await browser.new_context(
+                viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
+                device_scale_factor=2,
+            )
+            page = await ctx.new_page()
+            ok   = await _run_flow(page, pnr_text, output_path, verbose)
+            await browser.close()
+            return ok
+    except Exception as e:
+        if verbose: print(f"  [local] ❌ {e}")
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Post-process PIL: crop Co2 còn sót + whitespace thừa ở đáy
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _postprocess(img_path: str, verbose: bool = False):
+    """Tự động crop vùng trắng thừa và dòng Co2 còn sót ở đáy."""
     try:
         img = Image.open(img_path).convert("RGB")
         w, h = img.size
 
-        # Scan từ dưới lên để tìm text Co2
-        # Co2 line thường là text nhỏ màu xanh lá / xám ở cuối
-        crop_at = h
-        for y in range(h - 10, max(h - 80, 0), -1):
-            row_pixels = [img.getpixel((x, y)) for x in range(0, w, 5)]
-            # Pixel màu xanh lá (Co2 icon) hoặc xám nhạt
-            colored = sum(
-                1 for r, g, b in row_pixels
-                if not (r > 220 and g > 220 and b > 220)  # không phải trắng
-                and not (r < 30 and g < 30 and b < 30)    # không phải đen
+        # Tìm y cuối cùng có nội dung thực (pixel không trắng/xám quá nhạt)
+        last_y = h
+        for y in range(h - 1, max(h - 100, 0), -1):
+            row = [img.getpixel((x, y)) for x in range(0, w, 6)]
+            non_bg = sum(
+                1 for r, g, b in row
+                if not (r > 235 and g > 235 and b > 235)   # không trắng
+                and not (r < 20  and g < 20  and b < 20)    # không đen thuần
             )
-            ratio = colored / len(row_pixels)
-            if ratio > 0.05:
-                crop_at = y + 5
+            if non_bg / len(row) > 0.04:
+                last_y = y + 4
                 break
 
-        if crop_at < h - 5:
-            img.crop((0, 0, w, crop_at)).save(img_path, "PNG")
-            if verbose: print(f"  [crop] cắt tại y={crop_at} (bỏ {h-crop_at}px cuối)")
+        if last_y < h - 2:
+            img.crop((0, 0, w, last_y)).save(img_path, "PNG")
+            if verbose: print(f"  [PIL] crop bottom: {h}→{last_y}px")
+
     except Exception as e:
-        if verbose: print(f"  [crop] skip: {e}")
+        if verbose: print(f"  [PIL] skip: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Public API
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _async_pnr_to_image(pnr_text: str, output_path: str, verbose: bool) -> str:
-    """Thử lần lượt các mode cho đến khi thành công."""
-    # Mode 1: Browserless.io (ưu tiên khi deploy Render)
+async def _async_main(pnr_text: str, output_path: str, verbose: bool) -> str:
+    ok = False
     if BROWSERLESS_TOKEN:
-        if verbose: print("  [mode] Browserless.io")
         ok = await _via_browserless(pnr_text, output_path, verbose)
-        if ok and os.path.isfile(output_path):
-            _crop_co2(output_path, verbose)
-            return output_path
-
-    # Mode 2: Playwright local
-    if verbose: print("  [mode] Playwright local")
-    ok = await _via_playwright_local(pnr_text, output_path, verbose)
-    if ok and os.path.isfile(output_path):
-        _crop_co2(output_path, verbose)
-        return output_path
-
-    raise RuntimeError(
-        "Không thể chạy browser.\n"
-        "Local: python -m playwright install chromium\n"
-        "Render: set BROWSERLESS_TOKEN (đăng ký tại browserless.io)"
-    )
+    if not ok:
+        ok = await _via_playwright_local(pnr_text, output_path, verbose)
+    if not ok:
+        raise RuntimeError(
+            "Không thể chụp ảnh.\n"
+            "• Local : python -m playwright install chromium\n"
+            "• Render: kiểm tra BROWSERLESS_TOKEN"
+        )
+    _postprocess(output_path, verbose)
+    return output_path
 
 
 def pnr_to_image(pnr_text: str, output_path: str = None, verbose: bool = False) -> str:
-    """
-    Public API — gọi từ bot.py hoặc CLI.
-
-    Args:
-        pnr_text:    Nội dung PNR raw từ GDS
-        output_path: File ảnh output (.png). Mặc định: tạo temp file.
-        verbose:     In log chi tiết
-
-    Returns:
-        Đường dẫn file ảnh đã tạo
-    """
     if output_path is None:
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         output_path = tmp.name
         tmp.close()
-
-    asyncio.run(_async_pnr_to_image(pnr_text, output_path, verbose))
+    asyncio.run(_async_main(pnr_text, output_path, verbose))
     return output_path
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import argparse, sys
-
-    p = argparse.ArgumentParser(
-        description="PNR → pnrexpert.com → screenshot (bỏ Co2)"
-    )
-    p.add_argument("pnr", nargs="?", help="PNR text (hoặc đọc từ stdin)")
+    import argparse, sys as _sys
+    p = argparse.ArgumentParser(description="PNR → pnrexpert.com → PNG (full content)")
+    p.add_argument("pnr", nargs="?")
     p.add_argument("-o", "--output", default="pnr_result.png")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
-
-    pnr_text = args.pnr or sys.stdin.read()
-    print("🔄 Đang xử lý PNR...")
-    out = pnr_to_image(pnr_text.strip(), args.output, args.verbose)
-    print(f"✅ Kết quả: {out}  ({os.path.getsize(out)//1024} KB)")
+    pnr = args.pnr or _sys.stdin.read()
+    print(f"🔄 Xử lý PNR (browserless={'có' if BROWSERLESS_TOKEN else 'không'})...")
+    out = pnr_to_image(pnr.strip(), args.output, args.verbose)
+    print(f"✅ Xong: {out}  ({os.path.getsize(out)//1024} KB)")

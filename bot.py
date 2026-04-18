@@ -361,6 +361,53 @@ def ping():
     """Endpoint đơn giản cho self-ping."""
     return "pong", 200
 
+@flask_app.route("/debug_browserless", methods=["GET"])
+def debug_browserless():
+    """Test kết nối Browserless — truy cập URL này để kiểm tra."""
+    import os
+    token = os.environ.get("BROWSERLESS_TOKEN", "")
+    if not token:
+        return jsonify({"error": "BROWSERLESS_TOKEN chưa set"}), 400
+
+    results = {}
+
+    # Test các endpoint
+    endpoints = {
+        "v2_sfo":  f"wss://production-sfo.browserless.io?token={token}",
+        "v2_lon":  f"wss://production-lon.browserless.io?token={token}",
+        "v1_legacy": f"wss://chrome.browserless.io?token={token}",
+    }
+
+    async def _test_one(name, ws_url):
+        try:
+            from playwright.async_api import async_playwright
+            async with async_playwright() as pw:
+                browser = await pw.chromium.connect_over_cdp(ws_url, timeout=15_000)
+                page = await browser.new_context().then(lambda ctx: ctx.new_page()) if False else (await browser.new_context()).new_page()
+                await page.goto("https://example.com", timeout=10_000)
+                title = await page.title()
+                await browser.close()
+                return {"ok": True, "title": title}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
+
+    async def _run_all():
+        import asyncio
+        for name, url in endpoints.items():
+            results[name] = await _test_one(name, url)
+
+    try:
+        asyncio.run(_run_all())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({
+        "token_set": bool(token),
+        "token_preview": token[:8] + "..." if token else "",
+        "results": results,
+    })
+
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Local polling mode (python bot.py)
