@@ -108,6 +108,14 @@ _DELETE_RE = [re.compile(p, re.IGNORECASE) for p in [
     r"documentation,\s+which\s+applies\s+to\s+your\s+booking",
     r"your\s+personal\s+data\s+is\s+collected",
     r"\(applicable\s+for\s+interline\s+carriage\)",
+    # Baggage policy block (Air Canada / interline)
+    r"BAGGAGE\s+POLICY\s*[-–]",
+    r"IF\s+YOU\s+ARE\s+DENIED\s+BOARDING",
+    r"ENTITLED\s+TO\s+CERTAIN\s+STANDARDS",
+    r"PASSENGER\s+PROTECTION\s+REGULATIONS",
+    r"RIGHTS\s+PLEASE\s+CONTACT\s+YOUR\s+AIR\s+CARRIER",
+    r"AGENCY\s+WEBSITE",
+    r"CANADIAN\s+TRANSPORTATION",
 ]]
 
 def _should_delete(line):
@@ -268,19 +276,14 @@ def build_pdf(header_lines, body_lines, output_path, logo_path, luuy_path, verbo
     if verbose:
         print(f" [build] {len(blocks)} block(s)")
 
-    # Flag: đang trong vùng TICKET hay không
-    in_ticket_section = False
-
     for block_idx, block in enumerate(blocks):
-        # Block TICKET(S) → bật flag cho toàn bộ block
-        if block and is_ticket_start(block[0]):
-            in_ticket_section = True
-
         elements = []
         for line in block:
-            # Xác định màu/style từng dòng
-            if in_ticket_section:
-                # Toàn bộ vùng TICKET in đậm đỏ
+            s = line.strip()
+            # Chỉ tô đỏ: "FLIGHT TICKET(S)" và dòng "TICKET: ..."
+            if re.match(r"FLIGHT\s+TICKET\(S\)", s, re.IGNORECASE) or \
+               re.match(r"TICKET\s*:", s, re.IGNORECASE) or \
+               re.match(r"[A-Z]{2}/ETKT\s", s, re.IGNORECASE):
                 elements.append(MonoLine(line, bold=False, red=True))
             elif is_bold(line):
                 elements.append(MonoLine(line, bold=True, red=False))
@@ -295,8 +298,8 @@ def build_pdf(header_lines, body_lines, output_path, logo_path, luuy_path, verbo
             story.append(KeepTogether(elements[mid:]))
 
         if verbose:
-            ticket_mark = " 🔴" if in_ticket_section else ""
-            print(f" block {block_idx+1}: {len(block)} dòng{ticket_mark}")
+            has_ticket = any(re.match(r"FLIGHT\s+TICKET\(S\)", l.strip(), re.IGNORECASE) for l in block)
+            print(f" block {block_idx+1}: {len(block)} dòng{' 🔴' if has_ticket else ''}")
 
     # Ảnh Lưu ý
     story.append(Spacer(1, 14))
@@ -361,6 +364,7 @@ def main():
 
     convert(args.input, output, args.logo, args.luuy, args.verbose)
     print(f"✅ Hoàn thành! → {output} ({os.path.getsize(output)//1024} KB)")
+
 
 if __name__ == "__main__":
     main()
