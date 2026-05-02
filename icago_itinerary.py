@@ -135,24 +135,33 @@ def clean_body(lines, verbose=False):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def process_pages(pages, verbose=False):
-    header_lines, body_lines = [], []
+    """ Xử lý TẤT CẢ trang: - Trang 1: tách header (địa chỉ đại lý) + body (từ dòng FLIGHT đầu tiên) - Trang 2+: toàn bộ là body tiếp theo (không bỏ qua) Lý do: một số file có FLIGHT TICKET(S) nằm ở trang 2, 3... """
+    header_lines = []
+    all_body_lines = []
+
     for idx, page_text in enumerate(pages):
         lines = page_text.split("\n")
         if idx == 0:
+            # Trang 1: tách header và body
             flight_idx = next(
                 (i for i, l in enumerate(lines)
                  if re.search(r'FLIGHT\s+', l)
                  and not re.search(r'FLIGHT\s+BOOKING', l)),
                 len(lines),
             )
-            header_lines = parse_header(lines[:flight_idx], verbose)
-            body_lines   = clean_body(lines[flight_idx:], verbose)
+            header_lines   = parse_header(lines[:flight_idx], verbose)
+            page_body      = clean_body(lines[flight_idx:], verbose)
             if verbose:
-                print(f" [page 1] header={len(header_lines)}, body={len(body_lines)} dòng")
+                print(f" [page 1] header={len(header_lines)}, body={len(page_body)} dòng")
         else:
+            # Trang 2+: toàn bộ là body (bỏ dòng trắng đầu trang)
+            page_body = clean_body(lines, verbose)
             if verbose:
-                print(f" [page {idx+1}] bỏ qua")
-    return header_lines, body_lines
+                print(f" [page {idx+1}] body={len(page_body)} dòng (xử lý tiếp)")
+
+        all_body_lines.extend(page_body)
+
+    return header_lines, all_body_lines
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -352,5 +361,6 @@ def main():
 
     convert(args.input, output, args.logo, args.luuy, args.verbose)
     print(f"✅ Hoàn thành! → {output} ({os.path.getsize(output)//1024} KB)")
+
 if __name__ == "__main__":
-  main()
+    main()
