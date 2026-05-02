@@ -1,28 +1,11 @@
 #!/usr/bin/env python3
-"""
-icago_itinerary.py — ICAGO Itinerary Converter
-================================================
-✅ Windows / macOS / Linux — KHÔNG cần pdftotext.
-✅ Mỗi cụm FLIGHT luôn ở cùng một trang (không bị tách).
-
-Cài đặt:  pip install reportlab pillow pdfplumber
-
-Dùng CLI:
-  python icago_itinerary.py Itinerary.pdf
-  python icago_itinerary.py Itinerary.pdf output.pdf -v
-  python icago_itinerary.py --help
-
-Dùng import (từ bot.py):
-  from icago_itinerary import convert
-  convert("input.pdf", "output.pdf", logo_path=..., luuy_path=...)
-"""
+""" icago_itinerary.py — ICAGO Itinerary Converter ✅ Windows / macOS / Linux — KHÔNG cần pdftotext. ✅ Mỗi cụm FLIGHT luôn ở cùng một trang (không bị tách). ✅ Phần FLIGHT TICKET(S) in đậm màu đỏ. Cài đặt: pip install reportlab pillow pdfplumber """
 
 import argparse
 import os
 import re
 import sys
 
-# ── Thư viện ───────────────────────────────────────────────────────────────────
 try:
     import pdfplumber
 except ImportError:
@@ -30,6 +13,7 @@ except ImportError:
 
 try:
     from reportlab.lib.pagesizes import letter
+    from reportlab.lib import colors
     from reportlab.platypus import (
         SimpleDocTemplate, Spacer, Image as RLImage, Flowable, KeepTogether
     )
@@ -51,14 +35,16 @@ PAGE_W, PAGE_H = letter
 MARGIN_L  = 50
 MARGIN_R  = 50
 CONTENT_W = PAGE_W - MARGIN_L - MARGIN_R
-FONT_MONO = "Courier"
-FONT_BOLD = "Courier-Bold"
-FONT_SIZE = 8.5
-LINE_H    = 12
+FONT_MONO      = "Courier"
+FONT_BOLD      = "Courier-Bold"
+FONT_SIZE      = 8.5
+LINE_H         = 12
+COLOR_BLACK    = colors.black
+COLOR_RED_BOLD = colors.HexColor("#CC0000")   # đỏ đậm — dễ đọc trên giấy in
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. Trích xuất văn bản (layout mode — không cần pdftotext)
+# 1. Trích xuất văn bản
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_pages(pdf_path, verbose=False):
@@ -68,7 +54,7 @@ def extract_pages(pdf_path, verbose=False):
             text = page.extract_text(layout=True, x_density=7.25, y_density=13) or ""
             pages.append(text)
     if verbose:
-        print(f"  [extract] {len(pages)} trang trong '{pdf_path}'")
+        print(f" [extract] {len(pages)} trang trong '{pdf_path}'")
     return pages
 
 
@@ -77,12 +63,6 @@ def extract_pages(pdf_path, verbose=False):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_header(header_lines, verbose=False):
-    """
-    Header có 2 cột nối trên cùng dòng:
-      '          TUONG LAI VIET (BSP)              BOOKING REF: E6ZDTU'
-    Lấy phần phải của gap đầu tiên sau indent.
-    Giữ: BOOKING REF, tên hành khách. Bỏ: DATE, địa chỉ.
-    """
     kept = []
     for line in header_lines:
         stripped = line.rstrip()
@@ -98,15 +78,15 @@ def parse_header(header_lines, verbose=False):
         if not right:
             continue
         if re.match(r'^DATE\s*:', right, re.IGNORECASE):
-            if verbose: print(f"  [header] bỏ DATE   : {repr(right)}")
+            if verbose: print(f" [header] bỏ DATE : {repr(right)}")
             continue
         if re.match(r'^BOOKING\s+REF\s*:', right, re.IGNORECASE):
             kept.append(right)
-            if verbose: print(f"  [header] giữ       : {repr(right)}")
+            if verbose: print(f" [header] giữ : {repr(right)}")
             continue
         if re.match(r'^[A-Z\-]+/[A-Z]', right):
             kept.append(right)
-            if verbose: print(f"  [header] hành khách: {repr(right)}")
+            if verbose: print(f" [header] hành khách: {repr(right)}")
     return kept
 
 
@@ -142,7 +122,7 @@ def clean_body(lines, verbose=False):
         if skip_rest:
             continue
         if _should_delete(line):
-            if verbose: print(f"  [body] xóa: {repr(s[:80])}")
+            if verbose: print(f" [body] xóa: {repr(s[:80])}")
             continue
         result.append(line)
     while result and not result[-1].strip():
@@ -168,15 +148,15 @@ def process_pages(pages, verbose=False):
             header_lines = parse_header(lines[:flight_idx], verbose)
             body_lines   = clean_body(lines[flight_idx:], verbose)
             if verbose:
-                print(f"  [page 1] header={len(header_lines)}, body={len(body_lines)} dòng")
+                print(f" [page 1] header={len(header_lines)}, body={len(body_lines)} dòng")
         else:
             if verbose:
-                print(f"  [page {idx+1}] bỏ qua")
+                print(f" [page {idx+1}] bỏ qua")
     return header_lines, body_lines
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5. Style dòng
+# 5. Phân loại style từng dòng
 # ══════════════════════════════════════════════════════════════════════════════
 
 _BOLD_RE = [
@@ -185,35 +165,35 @@ _BOLD_RE = [
     re.compile(r"^\s*ARRIVAL\s*:",          re.IGNORECASE),
     re.compile(r"^\s*FLIGHT\s+TICKET\(S\)", re.IGNORECASE),
 ]
+_TICKET_SECTION_RE = re.compile(
+    r"^\s*(FLIGHT\s+TICKET\(S\)|TICKET\s*:|TICKET:|"
+    r"UA/ETKT|NH/ETKT|VN/ETKT|[A-Z]{2}/ETKT)",
+    re.IGNORECASE,
+)
 _FLIGHT_START_RE = re.compile(r"^\s*FLIGHT\s+(?!BOOKING|TICKET)", re.IGNORECASE)
 _TICKET_START_RE = re.compile(r"^\s*FLIGHT\s+TICKET\(S\)",        re.IGNORECASE)
+
 
 def is_bold(line):
     return any(rx.match(line) for rx in _BOLD_RE)
 
+def is_ticket_section(line):
+    """True cho FLIGHT TICKET(S) header VÀ tất cả dòng TICKET: bên dưới."""
+    return bool(_TICKET_SECTION_RE.match(line.strip()))
+
 def is_flight_start(line):
-    """True nếu dòng bắt đầu một cụm FLIGHT mới."""
     return bool(_FLIGHT_START_RE.match(line))
 
 def is_ticket_start(line):
-    """True nếu dòng bắt đầu phần FLIGHT TICKET(S)."""
     return bool(_TICKET_START_RE.match(line))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6. Nhóm body thành các "flight block" — dùng KeepTogether
+# 6. Nhóm thành flight blocks (KeepTogether)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def group_into_blocks(body_lines):
-    """
-    Chia body_lines thành các cụm:
-      - Mỗi cụm bắt đầu khi gặp dòng FLIGHT ... (không phải FLIGHT BOOKING / TICKET)
-      - Cụm FLIGHT TICKET(S) và sau đó là phần cuối
-    Trả về list of list[str].
-    """
-    blocks  = []
-    current = []
-
+    blocks, current = [], []
     for line in body_lines:
         if is_flight_start(line) or is_ticket_start(line):
             if current:
@@ -221,28 +201,32 @@ def group_into_blocks(body_lines):
             current = [line]
         else:
             current.append(line)
-
     if current:
         blocks.append(current)
-
     return blocks
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7. ReportLab Flowable
+# 7. ReportLab Flowable — MonoLine với hỗ trợ màu đỏ
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MonoLine(Flowable):
-    def __init__(self, text, bold=False):
+    """ Một dòng monospace. 3 chế độ: - normal : Courier, đen - bold : Courier-Bold, đen (FLIGHT / DEPARTURE / ARRIVAL) - ticket : Courier-Bold, ĐỎ (FLIGHT TICKET(S) + dòng TICKET:) """
+    def __init__(self, text, bold=False, red=False):
         super().__init__()
         self.text   = text
         self.bold   = bold
+        self.red    = red
         self.width  = CONTENT_W
         self.height = LINE_H
 
     def draw(self):
-        self.canv.setFont(FONT_BOLD if self.bold else FONT_MONO, FONT_SIZE)
+        font  = FONT_BOLD if (self.bold or self.red) else FONT_MONO
+        color = COLOR_RED_BOLD if self.red else COLOR_BLACK
+        self.canv.setFont(font, FONT_SIZE)
+        self.canv.setFillColor(color)
         self.canv.drawString(0, 2, self.text)
+        self.canv.setFillColor(COLOR_BLACK)   # reset về đen cho dòng tiếp theo
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -263,25 +247,37 @@ def build_pdf(header_lines, body_lines, output_path, logo_path, luuy_path, verbo
         story.append(_scaled_image(logo_path, CONTENT_W))
         story.append(Spacer(1, 8))
     else:
-        print(f"  ⚠️  Không tìm thấy logo: {logo_path}")
+        print(f" ⚠️ Không tìm thấy logo: {logo_path}")
 
-    # Header
+    # Header (BOOKING REF, tên hành khách)
     for line in header_lines:
-        story.append(MonoLine(line, bold=False))
+        story.append(MonoLine(line, bold=False, red=False))
     story.append(Spacer(1, 6))
 
-    # Body — nhóm thành các flight block, mỗi block dùng KeepTogether
+    # Body — chia block, KeepTogether
     blocks = group_into_blocks(body_lines)
     if verbose:
-        print(f"  [build] {len(blocks)} flight block(s)")
+        print(f" [build] {len(blocks)} block(s)")
+
+    # Flag: đang trong vùng TICKET hay không
+    in_ticket_section = False
 
     for block_idx, block in enumerate(blocks):
+        # Block TICKET(S) → bật flag cho toàn bộ block
+        if block and is_ticket_start(block[0]):
+            in_ticket_section = True
+
         elements = []
         for line in block:
-            elements.append(MonoLine(line, bold=is_bold(line)))
+            # Xác định màu/style từng dòng
+            if in_ticket_section:
+                # Toàn bộ vùng TICKET in đậm đỏ
+                elements.append(MonoLine(line, bold=False, red=True))
+            elif is_bold(line):
+                elements.append(MonoLine(line, bold=True, red=False))
+            else:
+                elements.append(MonoLine(line, bold=False, red=False))
 
-        # KeepTogether giữ toàn bộ block trên cùng một trang
-        # Nếu block quá dài (> 40 dòng), chia đôi để tránh lỗi overflow
         if len(elements) <= 40:
             story.append(KeepTogether(elements))
         else:
@@ -290,14 +286,15 @@ def build_pdf(header_lines, body_lines, output_path, logo_path, luuy_path, verbo
             story.append(KeepTogether(elements[mid:]))
 
         if verbose:
-            print(f"    block {block_idx+1}: {len(block)} dòng")
+            ticket_mark = " 🔴" if in_ticket_section else ""
+            print(f" block {block_idx+1}: {len(block)} dòng{ticket_mark}")
 
-    # Lưu ý
+    # Ảnh Lưu ý
     story.append(Spacer(1, 14))
     if luuy_path and os.path.isfile(luuy_path):
         story.append(_scaled_image(luuy_path, CONTENT_W))
     else:
-        print(f"  ⚠️  Không tìm thấy ảnh Lưu ý: {luuy_path}")
+        print(f" ⚠️ Không tìm thấy ảnh Lưu ý: {luuy_path}")
 
     SimpleDocTemplate(
         output_path,
@@ -310,17 +307,10 @@ def build_pdf(header_lines, body_lines, output_path, logo_path, luuy_path, verbo
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 9. Public API — dùng khi import từ bot.py
+# 9. Public API
 # ══════════════════════════════════════════════════════════════════════════════
 
 def convert(input_path, output_path, logo_path=DEFAULT_LOGO, luuy_path=DEFAULT_LUUY, verbose=False):
-    """
-    Hàm chính để gọi từ code khác (Telegram bot, Flask, v.v.)
-
-    Ví dụ:
-        from icago_itinerary import convert
-        convert("Itinerary.pdf", "output.pdf")
-    """
     if not os.path.isfile(input_path):
         raise FileNotFoundError(f"Không tìm thấy: {input_path}")
     pages = extract_pages(input_path, verbose)
@@ -338,22 +328,14 @@ def parse_args():
         prog="icago_itinerary",
         description="Chuyển đổi lịch trình GDS/Amadeus sang định dạng ICAGO PDF.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Ví dụ:
-  python icago_itinerary.py Itinerary.pdf
-  python icago_itinerary.py Itinerary.pdf KhachHang.pdf
-  python icago_itinerary.py Itinerary.pdf -o KhachHang.pdf --logo logo.png --luuy luuy.png
-  python icago_itinerary.py Itinerary.pdf -v
-        """,
+        epilog=""" Ví dụ: python icago_itinerary.py Itinerary.pdf python icago_itinerary.py Itinerary.pdf KhachHang.pdf python icago_itinerary.py Itinerary.pdf -o KhachHang.pdf --logo logo.png --luuy luuy.png python icago_itinerary.py Itinerary.pdf -v """,
     )
     p.add_argument("input",  help="File PDF đầu vào")
     p.add_argument("output", nargs="?", default=None,
                    help="File PDF đầu ra (mặc định: <input>_ICAGO.pdf)")
     p.add_argument("-o", "--output-file", dest="output_file", default=None, metavar="PATH")
-    p.add_argument("--logo", default=DEFAULT_LOGO, metavar="FILE",
-                   help="Ảnh logo ICAGO  (mặc định: icago_logo.png)")
-    p.add_argument("--luuy", default=DEFAULT_LUUY, metavar="FILE",
-                   help="Ảnh Lưu ý       (mặc định: icago_luuy.png)")
+    p.add_argument("--logo", default=DEFAULT_LOGO, metavar="FILE")
+    p.add_argument("--luuy", default=DEFAULT_LUUY, metavar="FILE")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
 
@@ -363,16 +345,12 @@ def main():
     output = args.output_file or args.output or \
              os.path.splitext(args.input)[0] + "_ICAGO.pdf"
 
-    print(f"📄 Input  : {args.input}")
+    print(f"📄 Input : {args.input}")
     print(f"📝 Output : {output}")
-    print(f"🖼️  Logo   : {args.logo}")
-    print(f"🖼️  Lưu ý : {args.luuy}")
     if args.verbose:
         print("🔍 Verbose ON\n")
 
     convert(args.input, output, args.logo, args.luuy, args.verbose)
-    print(f"✅ Hoàn thành! → {output}  ({os.path.getsize(output)//1024} KB)")
-
-
+    print(f"✅ Hoàn thành! → {output} ({os.path.getsize(output)//1024} KB)")
 if __name__ == "__main__":
-    main()
+  main()
