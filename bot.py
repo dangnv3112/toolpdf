@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-""" bot.py — ICAGO Telegram Bot Chạy local : python bot.py Deploy Render: gunicorn bot:flask_app --bind 0.0.0.0:$PORT --workers 1 --timeout 120 """
+"""
+bot.py — ICAGO Telegram Bot
+Chạy local  : python bot.py
+Deploy Render: gunicorn bot:flask_app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+"""
 
 import asyncio
 import logging
@@ -20,10 +24,10 @@ log = logging.getLogger("icago_bot")
 
 # ── Telegram ───────────────────────────────────────────────────────────────────
 try:
-    from telegram import Update, Bot
+    from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
     from telegram.ext import (
         Application, CommandHandler, MessageHandler,
-        filters, ContextTypes
+        filters, ContextTypes, CallbackQueryHandler,
     )
 except ImportError:
     sys.exit("❌ pip install python-telegram-bot")
@@ -45,6 +49,16 @@ try:
     from icago_itinerary import convert, DEFAULT_LOGO, DEFAULT_LUUY
 except ImportError as e:
     sys.exit(f"❌ Không import được icago_itinerary: {e}")
+
+# ── Word (.docx) converter ─────────────────────────────────────────────────────
+try:
+    from icago_word import convert_docx
+    DOCX_ENABLED = True
+    log.info("DOCX converter: ✅ enabled")
+except ImportError:
+    DOCX_ENABLED = False
+    convert_docx = None
+    log.info("DOCX converter: ⚠️ disabled (icago_word.py không tìm thấy)")
 
 # ── PNR screenshot (không bắt buộc) ───────────────────────────────────────────
 try:
@@ -76,13 +90,20 @@ if not BOT_TOKEN:
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL  = f"{RENDER_URL}{WEBHOOK_PATH}" if RENDER_URL else ""
 
+# ── State lưu PDF đang chờ rename (user_id → {path, default_name}) ─────────────
+_pending_pdf: dict[int, dict] = {}
+_pending_dirs: dict[int, object] = {}  # giữ TemporaryDirectory sống
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Self-ping — giữ Render không sleep
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _self_ping_loop():
-    """ Gọi chính URL Render mỗi PING_INTERVAL giây để tránh bị sleep. Chạy trong daemon thread riêng — không ảnh hưởng bot. """
+    """
+    Gọi chính URL Render mỗi PING_INTERVAL giây để tránh bị sleep.
+    Chạy trong daemon thread riêng — không ảnh hưởng bot.
+    """
     if not RENDER_URL or not _requests:
         log.info("Self-ping: tắt (RENDER_URL chưa set hoặc thiếu requests)")
         return
@@ -151,12 +172,14 @@ HELP_TEXT = (
     "📖 *ICAGO Bot — Hướng dẫn*\n\n"
     "📎 *Gửi file PDF* lịch trình GDS/Amadeus\n"
     "→ Nhận PDF chuẩn ICAGO (logo, bold, bỏ rác)\n\n"
+    "📝 *Gửi file Word (.docx)* lịch trình\n"
+    "→ Nhận PDF chuẩn ICAGO (bỏ logo cũ, thêm ICAGO logo)\n\n"
     + (
         "✈️ *Gửi mã PNR* (text từ GDS)\n"
         "→ Nhận ảnh lịch trình từ pnrexpert.com\n\n"
         if PNR_ENABLED else ""
     )
-    + "📌 Lệnh: /start /help"
+    + "📌 Lệnh: /start  /help"
 )
 
 
@@ -174,43 +197,149 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
-    if not doc.file_name.lower().endswith(".pdf"):
-        await update.message.reply_text("❌ Vui lòng gửi file *PDF*.", parse_mode="Markdown")
+    fname_lower = doc.file_name.lower()
+    is_pdf  = fname_lower.endswith(".pdf")
+    is_docx = fname_lower.endswith(".docx")
+
+    if not is_pdf and not is_docx:
+        await update.message.reply_text("❌ Vui lòng gửi file *PDF* hoặc *Word (.docx)*.", parse_mode="Markdown")
+        return
+    if is_docx and not DOCX_ENABLED:
+        await update.message.reply_text("⚠️ Tính năng Word chưa sẵn sàng (thiếu icago_word.py).")
         return
     if doc.file_size > MAX_MB * 1024 * 1024:
         await update.message.reply_text(f"❌ File quá lớn (tối đa {MAX_MB} MB).")
         return
 
-    status = await update.message.reply_text("⏳ Đang xử lý PDF...")
-    log.info(f"PDF: {doc.file_name} từ {update.effective_user.full_name}")
+    file_type = "Word (.docx)" if is_docx else "PDF"
+    status = await update.message.reply_text(f"⏳ Đang xử lý {file_type}...")
+    log.info(f"{file_type}: {doc.file_name} từ {update.effective_user.full_name}")
 
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            inp  = os.path.join(tmp, "input.pdf")
-            name = Path(doc.file_name).stem + "_ICAGO.pdf"
-            out  = os.path.join(tmp, name)
+        # Tạo TempDir và giữ nó sống (không dùng `with` vì cần đợi user rename)
+        import tempfile as _tf
+        tmp_obj = _tf.TemporaryDirectory()
+        tmp = tmp_obj.name
 
-            tgf = await ctx.bot.get_file(doc.file_id)
-            await tgf.download_to_drive(inp)
+        ext_in   = ".docx" if is_docx else ".pdf"
+        inp      = os.path.join(tmp, f"input{ext_in}")
+        default_name = Path(doc.file_name).stem + "_ICAGO.pdf"
+        out      = os.path.join(tmp, default_name)
+
+        tgf = await ctx.bot.get_file(doc.file_id)
+        await tgf.download_to_drive(inp)
+
+        if is_docx:
+            convert_docx(inp, out, logo_path=LOGO_PATH, luuy_path=LUUY_PATH)
+        else:
             convert(inp, out, logo_path=LOGO_PATH, luuy_path=LUUY_PATH)
 
-            with open(out, "rb") as f:
-                await update.message.reply_document(
-                    document=f, filename=name,
-                    caption=f"✅ Hoàn thành! ({os.path.getsize(out)//1024} KB)",
-                )
+        user_id = update.effective_user.id
+        _pending_pdf[user_id]  = {"out": out, "default_name": default_name}
+        _pending_dirs[user_id] = tmp_obj   # giữ thư mục tạm không bị xóa
+
         await status.delete()
-        log.info(f"✅ PDF xong: {name}")
+
+        # Hỏi rename qua inline keyboard
+        stem = Path(doc.file_name).stem
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"📄 Giữ tên mặc định: {default_name}",
+                callback_data=f"pdf_send|{user_id}|default"
+            )
+        ]])
+        await update.message.reply_text(
+            f"✅ Xử lý xong!\n\n"
+            f"📝 *Đặt tên file output* (gõ tên mới không cần đuôi .pdf)\n"
+            f"hoặc nhấn nút bên dưới để dùng tên mặc định:",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+        log.info(f"✅ PDF xong, đang chờ rename: {default_name}")
 
     except Exception as e:
         log.exception("Lỗi PDF")
         await status.edit_text(f"❌ Lỗi:\n`{e}`", parse_mode="Markdown")
 
 
+async def _send_pdf_to_user(update_or_query, ctx, user_id: int, final_name: str):
+    """Gửi PDF đã xử lý đến user với tên file đã chọn."""
+    pending = _pending_pdf.pop(user_id, None)
+    tmp_obj = _pending_dirs.pop(user_id, None)
+    if not pending:
+        msg = "❌ Không tìm thấy file PDF. Vui lòng gửi lại."
+        if hasattr(update_or_query, 'message'):
+            await update_or_query.message.reply_text(msg)
+        else:
+            await update_or_query.edit_message_text(msg)
+        return
+
+    out = pending["out"]
+    if not final_name.lower().endswith(".pdf"):
+        final_name += ".pdf"
+
+    try:
+        with open(out, "rb") as f:
+            if hasattr(update_or_query, 'message') and update_or_query.message:
+                await update_or_query.message.reply_document(
+                    document=f, filename=final_name,
+                    caption=f"✅ Hoàn thành! ({os.path.getsize(out)//1024} KB)\n📄 {final_name}",
+                )
+            else:
+                # Callback query — gửi về chat gốc
+                await ctx.bot.send_document(
+                    chat_id=update_or_query.message.chat_id if hasattr(update_or_query, 'message') and update_or_query.message else update_or_query.from_user.id,
+                    document=open(out, "rb"), filename=final_name,
+                    caption=f"✅ Hoàn thành! ({os.path.getsize(out)//1024} KB)\n📄 {final_name}",
+                )
+        log.info(f"✅ Đã gửi PDF: {final_name}")
+    except Exception as e:
+        log.exception("Lỗi gửi PDF")
+        err = f"❌ Lỗi gửi file:\n`{e}`"
+        if hasattr(update_or_query, 'message') and update_or_query.message:
+            await update_or_query.message.reply_text(err, parse_mode="Markdown")
+    finally:
+        if tmp_obj:
+            try: tmp_obj.cleanup()
+            except Exception: pass
+
+
+async def handle_pdf_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Xử lý khi user nhấn nút 'Giữ tên mặc định'."""
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split("|")
+    if len(parts) < 3 or parts[0] != "pdf_send":
+        return
+    user_id = int(parts[1])
+    pending = _pending_pdf.get(user_id)
+    if not pending:
+        await query.edit_message_text("❌ Phiên đã hết hạn. Vui lòng gửi lại PDF.")
+        return
+    await query.edit_message_text(f"📤 Đang gửi *{pending['default_name']}*...", parse_mode="Markdown")
+    await _send_pdf_to_user(query, ctx, user_id, pending["default_name"])
+
+
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
         return
+
+    user_id = update.effective_user.id
+
+    # ── Ưu tiên: user đang nhập tên file output cho PDF vừa xử lý ──────────────
+    if user_id in _pending_pdf:
+        # Kiểm tra text có vẻ là tên file hợp lệ (không phải PNR)
+        if not looks_like_pnr(text) and len(text) < 200 and '\n' not in text:
+            # Làm sạch tên file
+            safe_name = re.sub(r'[\\/*?:"<>|]', '_', text).strip()
+            safe_name = safe_name.rstrip('.')
+            if not safe_name:
+                await update.message.reply_text("❌ Tên file không hợp lệ. Vui lòng nhập lại.")
+                return
+            await update.message.reply_text(f"📤 Đang gửi *{safe_name}.pdf*...", parse_mode="Markdown")
+            await _send_pdf_to_user(update, ctx, user_id, safe_name)
+            return
 
     if not looks_like_pnr(text):
         await update.message.reply_text(
@@ -261,6 +390,7 @@ def _build_ptb() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_help))
+    app.add_handler(CallbackQueryHandler(handle_pdf_callback, pattern=r"^pdf_send\|"))
     app.add_handler(MessageHandler(filters.Document.ALL,            handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.ALL,                     handle_other))
