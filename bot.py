@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""
+bot.py — ICAGO Telegram Bot
+Chạy local  : python bot.py
+Deploy Render: gunicorn bot:flask_app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+"""
 
 import asyncio
 import logging
