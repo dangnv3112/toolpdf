@@ -90,9 +90,8 @@ if not BOT_TOKEN:
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL  = f"{RENDER_URL}{WEBHOOK_PATH}" if RENDER_URL else ""
 
-# ── State lưu PDF đang chờ rename (user_id → {path, default_name}) ─────────────
-_pending_pdf: dict[int, dict] = {}
-_pending_dirs: dict[int, object] = {}  # giữ TemporaryDirectory sống
+# ── State lưu file đang chờ đặt tên (user_id → {file_id, file_name, is_docx, default_name}) ──
+_pending_input: dict[int, dict] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -165,6 +164,16 @@ def looks_like_pnr(text: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _sanitize_filename(name: str) -> str:
+    """Làm sạch tên file, bỏ ký tự không hợp lệ."""
+    safe = re.sub(r'[\\/*?:"<>|]', '_', name).strip().rstrip('.')
+    return safe or "output"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Handlers
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -196,13 +205,20 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Nhận file PDF hoặc DOCX.
+    Hỏi tên file output TRƯỚC khi xử lý.
+    """
     doc = update.message.document
     fname_lower = doc.file_name.lower()
     is_pdf  = fname_lower.endswith(".pdf")
     is_docx = fname_lower.endswith(".docx")
 
     if not is_pdf and not is_docx:
-        await update.message.reply_text("❌ Vui lòng gửi file *PDF* hoặc *Word (.docx)*.", parse_mode="Markdown")
+        await update.message.reply_text(
+            "❌ Vui lòng gửi file *PDF* hoặc *Word (.docx)*.",
+            parse_mode="Markdown"
+        )
         return
     if is_docx and not DOCX_ENABLED:
         await update.message.reply_text("⚠️ Tính năng Word chưa sẵn sàng (thiếu icago_word.py).")
@@ -211,113 +227,152 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ File quá lớn (tối đa {MAX_MB} MB).")
         return
 
+    user_id = update.effective_user.id
     file_type = "Word (.docx)" if is_docx else "PDF"
-    status = await update.message.reply_text(f"⏳ Đang xử lý {file_type}...")
-    log.info(f"{file_type}: {doc.file_name} từ {update.effective_user.full_name}")
+    default_name = Path(doc.file_name).stem + "_ICAGO"
+
+    # Xóa pending cũ nếu có (user gửi file mới trước khi xử lý file cũ)
+    _pending_input.pop(user_id, None)
+
+    # Lưu thông tin file vào pending_input — chờ user đặt tên
+    _pending_input[user_id] = {
+        "file_id":    doc.file_id,
+        "file_name":  doc.file_name,
+        "is_docx":    is_docx,
+        "file_type":  file_type,
+        "default_name": default_name,
+    }
+
+    log.info(f"📥 Nhận {file_type}: {doc.file_name} từ {update.effective_user.full_name} — chờ đặt tên")
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"📄 Dùng tên mặc định: {default_name}.pdf",
+            callback_data=f"use_default_name|{user_id}"
+        )
+    ]])
+    await update.message.reply_text(
+        f"✅ Đã nhận file *{doc.file_name}* ({file_type})\n\n"
+        f"📝 *Nhập tên file output* (không cần đuôi `.pdf`)\n"
+        f"hoặc nhấn nút bên dưới để dùng tên mặc định:",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+async def _process_and_send(update_or_query, ctx, user_id: int, output_name: str):
+    """
+    Download file, chuyển đổi, rồi gửi PDF về cho user.
+    Dùng cho cả callback (nút mặc định) lẫn nhập tên thủ công.
+    """
+    pending = _pending_input.pop(user_id, None)
+    if not pending:
+        msg = "❌ Không tìm thấy file đang chờ. Vui lòng gửi lại file."
+        if hasattr(update_or_query, 'message') and update_or_query.message:
+            await update_or_query.message.reply_text(msg)
+        else:
+            await ctx.bot.send_message(chat_id=update_or_query.from_user.id, text=msg)
+        return
+
+    if not output_name.lower().endswith(".pdf"):
+        output_name += ".pdf"
+
+    file_type    = pending["file_type"]
+    is_docx      = pending["is_docx"]
+    original_name = pending["file_name"]
+
+    # Thông báo đang xử lý
+    if hasattr(update_or_query, 'message') and update_or_query.message:
+        status = await update_or_query.message.reply_text(
+            f"⏳ Đang xử lý *{file_type}*: `{original_name}` → `{output_name}`...",
+            parse_mode="Markdown"
+        )
+        send_doc_to = update_or_query.message
+    else:
+        # Callback query
+        await update_or_query.edit_message_text(
+            f"⏳ Đang xử lý *{file_type}*: `{original_name}` → `{output_name}`...",
+            parse_mode="Markdown"
+        )
+        status = None
+        send_doc_to = None
+
+    log.info(f"⚙️ Xử lý {file_type}: {original_name} → {output_name}")
 
     try:
-        # Tạo TempDir và giữ nó sống (không dùng `with` vì cần đợi user rename)
         import tempfile as _tf
         tmp_obj = _tf.TemporaryDirectory()
         tmp = tmp_obj.name
 
-        ext_in   = ".docx" if is_docx else ".pdf"
-        inp      = os.path.join(tmp, f"input{ext_in}")
-        default_name = Path(doc.file_name).stem + "_ICAGO.pdf"
-        out      = os.path.join(tmp, default_name)
+        ext_in = ".docx" if is_docx else ".pdf"
+        inp    = os.path.join(tmp, f"input{ext_in}")
+        out    = os.path.join(tmp, output_name)
 
-        tgf = await ctx.bot.get_file(doc.file_id)
+        # Download file từ Telegram
+        tgf = await ctx.bot.get_file(pending["file_id"])
         await tgf.download_to_drive(inp)
 
+        # Chuyển đổi
         if is_docx:
             convert_docx(inp, out, logo_path=LOGO_PATH, luuy_path=LUUY_PATH)
         else:
             convert(inp, out, logo_path=LOGO_PATH, luuy_path=LUUY_PATH)
 
-        user_id = update.effective_user.id
-        _pending_pdf[user_id]  = {"out": out, "default_name": default_name}
-        _pending_dirs[user_id] = tmp_obj   # giữ thư mục tạm không bị xóa
+        size_kb = os.path.getsize(out) // 1024
 
-        await status.delete()
-
-        # Hỏi rename qua inline keyboard
-        stem = Path(doc.file_name).stem
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                f"📄 Giữ tên mặc định: {default_name}",
-                callback_data=f"pdf_send|{user_id}|default"
-            )
-        ]])
-        await update.message.reply_text(
-            f"✅ Xử lý xong!\n\n"
-            f"📝 *Đặt tên file output* (gõ tên mới không cần đuôi .pdf)\n"
-            f"hoặc nhấn nút bên dưới để dùng tên mặc định:",
-            parse_mode="Markdown",
-            reply_markup=keyboard,
-        )
-        log.info(f"✅ PDF xong, đang chờ rename: {default_name}")
-
-    except Exception as e:
-        log.exception("Lỗi PDF")
-        await status.edit_text(f"❌ Lỗi:\n`{e}`", parse_mode="Markdown")
-
-
-async def _send_pdf_to_user(update_or_query, ctx, user_id: int, final_name: str):
-    """Gửi PDF đã xử lý đến user với tên file đã chọn."""
-    pending = _pending_pdf.pop(user_id, None)
-    tmp_obj = _pending_dirs.pop(user_id, None)
-    if not pending:
-        msg = "❌ Không tìm thấy file PDF. Vui lòng gửi lại."
-        if hasattr(update_or_query, 'message'):
-            await update_or_query.message.reply_text(msg)
-        else:
-            await update_or_query.edit_message_text(msg)
-        return
-
-    out = pending["out"]
-    if not final_name.lower().endswith(".pdf"):
-        final_name += ".pdf"
-
-    try:
+        # Gửi file PDF
         with open(out, "rb") as f:
-            if hasattr(update_or_query, 'message') and update_or_query.message:
-                await update_or_query.message.reply_document(
-                    document=f, filename=final_name,
-                    caption=f"✅ Hoàn thành! ({os.path.getsize(out)//1024} KB)\n📄 {final_name}",
+            caption = f"✅ Hoàn thành! ({size_kb} KB)\n📄 {output_name}"
+            if send_doc_to:
+                await send_doc_to.reply_document(
+                    document=f, filename=output_name, caption=caption
                 )
             else:
-                # Callback query — gửi về chat gốc
                 await ctx.bot.send_document(
-                    chat_id=update_or_query.message.chat_id if hasattr(update_or_query, 'message') and update_or_query.message else update_or_query.from_user.id,
-                    document=open(out, "rb"), filename=final_name,
-                    caption=f"✅ Hoàn thành! ({os.path.getsize(out)//1024} KB)\n📄 {final_name}",
+                    chat_id=update_or_query.from_user.id,
+                    document=open(out, "rb"),
+                    filename=output_name,
+                    caption=caption,
                 )
-        log.info(f"✅ Đã gửi PDF: {final_name}")
+
+        if status:
+            await status.delete()
+
+        log.info(f"✅ Đã gửi PDF: {output_name} ({size_kb} KB)")
+
     except Exception as e:
-        log.exception("Lỗi gửi PDF")
-        err = f"❌ Lỗi gửi file:\n`{e}`"
-        if hasattr(update_or_query, 'message') and update_or_query.message:
-            await update_or_query.message.reply_text(err, parse_mode="Markdown")
+        log.exception("Lỗi xử lý/gửi file")
+        err_msg = f"❌ Lỗi:\n`{e}`"
+        if status:
+            await status.edit_text(err_msg, parse_mode="Markdown")
+        elif send_doc_to:
+            await send_doc_to.reply_text(err_msg, parse_mode="Markdown")
+        else:
+            await ctx.bot.send_message(
+                chat_id=update_or_query.from_user.id,
+                text=err_msg, parse_mode="Markdown"
+            )
     finally:
-        if tmp_obj:
-            try: tmp_obj.cleanup()
-            except Exception: pass
+        try: tmp_obj.cleanup()
+        except Exception: pass
 
 
-async def handle_pdf_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Xử lý khi user nhấn nút 'Giữ tên mặc định'."""
+async def handle_name_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Xử lý khi user nhấn nút 'Dùng tên mặc định'."""
     query = update.callback_query
     await query.answer()
     parts = query.data.split("|")
-    if len(parts) < 3 or parts[0] != "pdf_send":
+    if len(parts) < 2 or parts[0] != "use_default_name":
         return
+
     user_id = int(parts[1])
-    pending = _pending_pdf.get(user_id)
+    pending = _pending_input.get(user_id)
     if not pending:
-        await query.edit_message_text("❌ Phiên đã hết hạn. Vui lòng gửi lại PDF.")
+        await query.edit_message_text("❌ Phiên đã hết hạn. Vui lòng gửi lại file.")
         return
-    await query.edit_message_text(f"📤 Đang gửi *{pending['default_name']}*...", parse_mode="Markdown")
-    await _send_pdf_to_user(query, ctx, user_id, pending["default_name"])
+
+    output_name = pending["default_name"]
+    await _process_and_send(query, ctx, user_id, output_name)
 
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -327,23 +382,20 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
 
-    # ── Ưu tiên: user đang nhập tên file output cho PDF vừa xử lý ──────────────
-    if user_id in _pending_pdf:
-        # Kiểm tra text có vẻ là tên file hợp lệ (không phải PNR)
+    # ── Ưu tiên 1: user đang nhập tên file output cho file vừa gửi ────────────
+    if user_id in _pending_input:
         if not looks_like_pnr(text) and len(text) < 200 and '\n' not in text:
-            # Làm sạch tên file
-            safe_name = re.sub(r'[\\/*?:"<>|]', '_', text).strip()
-            safe_name = safe_name.rstrip('.')
+            safe_name = _sanitize_filename(text)
             if not safe_name:
                 await update.message.reply_text("❌ Tên file không hợp lệ. Vui lòng nhập lại.")
                 return
-            await update.message.reply_text(f"📤 Đang gửi *{safe_name}.pdf*...", parse_mode="Markdown")
-            await _send_pdf_to_user(update, ctx, user_id, safe_name)
+            await _process_and_send(update, ctx, user_id, safe_name)
             return
 
+    # ── Ưu tiên 2: PNR ────────────────────────────────────────────────────────
     if not looks_like_pnr(text):
         await update.message.reply_text(
-            "📎 Gửi *file PDF* hoặc *mã PNR*.\n/help để biết thêm.",
+            "📎 Gửi *file PDF* hoặc *Word (.docx)* để chuyển đổi.\n/help để biết thêm.",
             parse_mode="Markdown",
         )
         return
@@ -352,6 +404,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Tính năng PNR chưa sẵn sàng.")
         return
 
+    import asyncio as _asyncio
     log.info(f"PNR từ {update.effective_user.full_name}: {text[:60]}")
     status = await update.message.reply_text(
         "✈️ Đang xử lý PNR...\n_(10–20 giây)_", parse_mode="Markdown",
@@ -359,7 +412,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         with tempfile.TemporaryDirectory() as tmp:
             img_path = os.path.join(tmp, "pnr_result.png")
-            await asyncio.get_event_loop().run_in_executor(
+            await _asyncio.get_event_loop().run_in_executor(
                 None, lambda: pnr_to_image(text, img_path)
             )
             if not os.path.isfile(img_path) or os.path.getsize(img_path) < 1000:
@@ -377,7 +430,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📎 Gửi *file PDF* hoặc *mã PNR*. /help",
+        "📎 Gửi *file PDF* hoặc *Word (.docx)*. /help",
         parse_mode="Markdown",
     )
 
@@ -390,7 +443,7 @@ def _build_ptb() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_help))
-    app.add_handler(CallbackQueryHandler(handle_pdf_callback, pattern=r"^pdf_send\|"))
+    app.add_handler(CallbackQueryHandler(handle_name_callback, pattern=r"^use_default_name\|"))
     app.add_handler(MessageHandler(filters.Document.ALL,            handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.ALL,                     handle_other))
@@ -448,6 +501,7 @@ def health():
         "pending":      pending,
         "last_error":   err,
         "pnr_enabled":  PNR_ENABLED,
+        "docx_enabled": DOCX_ENABLED,
         "ping_interval": f"{PING_INTERVAL}s",
     })
 
@@ -484,17 +538,16 @@ def ping():
     """Endpoint đơn giản cho self-ping."""
     return "pong", 200
 
+
 @flask_app.route("/debug_browserless", methods=["GET"])
 def debug_browserless():
     """Test kết nối Browserless — truy cập URL này để kiểm tra."""
-    import os
     token = os.environ.get("BROWSERLESS_TOKEN", "")
     if not token:
         return jsonify({"error": "BROWSERLESS_TOKEN chưa set"}), 400
 
     results = {}
 
-    # Test các endpoint
     endpoints = {
         "v2_sfo":  f"wss://production-sfo.browserless.io?token={token}",
         "v2_lon":  f"wss://production-lon.browserless.io?token={token}",
@@ -506,7 +559,7 @@ def debug_browserless():
             from playwright.async_api import async_playwright
             async with async_playwright() as pw:
                 browser = await pw.chromium.connect_over_cdp(ws_url, timeout=15_000)
-                page = await browser.new_context().then(lambda ctx: ctx.new_page()) if False else (await browser.new_context()).new_page()
+                page = await (await browser.new_context()).new_page()
                 await page.goto("https://example.com", timeout=10_000)
                 title = await page.title()
                 await browser.close()
@@ -515,7 +568,6 @@ def debug_browserless():
             return {"ok": False, "error": str(e)[:200]}
 
     async def _run_all():
-        import asyncio
         for name, url in endpoints.items():
             results[name] = await _test_one(name, url)
 
@@ -529,7 +581,6 @@ def debug_browserless():
         "token_preview": token[:8] + "..." if token else "",
         "results": results,
     })
-
 
 
 # ══════════════════════════════════════════════════════════════════════════════
