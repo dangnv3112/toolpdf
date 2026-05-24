@@ -22,7 +22,7 @@ except ImportError:
     sys.exit("pip install python-docx")
 
 try:
-    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.pagesizes import A4
     from reportlab.platypus import (
         SimpleDocTemplate, Spacer, Image as RLImage, Flowable, KeepTogether
     )
@@ -41,8 +41,8 @@ DEFAULT_LOGO = os.path.join(_DIR, "icago_logo.png")
 DEFAULT_LUUY = os.path.join(_DIR, "icago_luuy.png")
 
 # ── Layout (dong nhat voi icago_itinerary) ─────────────────────────────────────
-PAGE_W, PAGE_H = letter
-ML = 46; MR = 46; MT = 24; MB = 28
+PAGE_W, PAGE_H = A4
+ML = 59; MR = 49; MT = 24; MB = 28
 CW = PAGE_W - ML - MR        # ~520 pt
 
 FN  = "Courier"
@@ -55,10 +55,10 @@ LHE = 3
 BLACK = colors.black
 RED   = colors.HexColor("#CC0000")
 
-FLIGHT_LABEL_W = 7  * CW_
-FLIGHT_DATE_W  = 17 * CW_
-DEPTARR_LBL_W  = 11 * CW_
-LOGO_W         = CW * 0.42
+FLIGHT_LABEL_W = 66
+FLIGHT_DATE_W  = 373
+DEPTARR_LBL_W  = 66
+LOGO_W         = CW
 
 # ── Regexes ────────────────────────────────────────────────────────────────────
 _FLIGHT_RE    = re.compile(r"^FLIGHT\s+(?!BOOKING|TICKET)", re.I)
@@ -137,9 +137,8 @@ class FlightLine(Flowable):
         self.canv.setFont(FB, FS)
         self.canv.setFillColor(BLACK)
         self.canv.drawString(0, 2, "FLIGHT")
-        self.canv.drawString(FLIGHT_LABEL_W + 4, 2, self.info)
-        dw = self.canv.stringWidth(self.date, FB, FS)
-        self.canv.drawString(CW - dw, 2, self.date)
+        self.canv.drawString(FLIGHT_LABEL_W, 2, self.info)
+        self.canv.drawString(FLIGHT_DATE_W, 2, self.date)
 
 
 class DepArrLine(Flowable):
@@ -156,10 +155,9 @@ class DepArrLine(Flowable):
         self.canv.setFillColor(BLACK)
         lw = self.canv.stringWidth(self.label + " ", FB, FS)
         self.canv.drawString(0, 2, self.label)
-        self.canv.drawString(lw, 2, self.location)
+        self.canv.drawString(DEPTARR_LBL_W, 2, self.location)
         if self.time_part:
-            tw = self.canv.stringWidth(self.time_part, FB, FS)
-            self.canv.drawString(CW - tw, 2, self.time_part)
+            self.canv.drawString(397, 2, self.time_part)
 
 
 class SepLine(Flowable):
@@ -371,7 +369,7 @@ def _block_to_elements(block):
 
         # OPERATED BY
         if _OPERATED_RE.match(s):
-            elements.append(MonoLine(s, indent=FLIGHT_LABEL_W + 4))
+            elements.append(MonoLine(s, indent=FLIGHT_LABEL_W))
             after_dep_arr = False
             continue
 
@@ -382,15 +380,15 @@ def _block_to_elements(block):
             after_dep_arr = True
             continue
 
-        # Continuation after DEP/ARR (e.g. TERMINAL 2)
+        # Continuation after DEP/ARR (e.g. TERMINAL 2) — bold, indented
         if after_dep_arr and not re.match(r'[A-Z ]+\s*:', s) and not _FLIGHT_RE.match(s):
-            elements.append(MonoLine(s, indent=DEPTARR_LBL_W))
+            elements.append(MonoLine(s, bold=True, indent=DEPTARR_LBL_W))
             continue
         else:
             after_dep_arr = False
 
-        # Everything else: normal
-        elements.append(MonoLine(s))
+        # Everything else: normal, indented
+        elements.append(MonoLine(s, indent=FLIGHT_LABEL_W))
 
     return elements
 
@@ -458,7 +456,7 @@ def build_pdf(booking_ref, passengers, body_lines, output_path,
 
     SimpleDocTemplate(
         output_path,
-        pagesize=letter,
+        pagesize=A4,
         leftMargin=ML, rightMargin=MR,
         topMargin=MT, bottomMargin=MB,
     ).build(story)
