@@ -71,7 +71,7 @@ DEPTARR_LBL_W  = 11 * CW_        # ~56 pt
 DEPTARR_TIME_W = 13 * CW_        # ~66 pt  "DD MMM HH:MM"
 DEPTARR_LOC_W  = CW - DEPTARR_LBL_W - DEPTARR_TIME_W
 
-LOGO_W = CW * 0.38               # ~40% width
+LOGO_W = CW * 0.42               # ~42% width, centered via HAlign in build_pdf
 
 # ── Regexes ────────────────────────────────────────────────────────────────────
 _FLIGHT_RE    = re.compile(r"^\s*FLIGHT\s+(?!BOOKING|TICKET)", re.I)
@@ -466,18 +466,20 @@ def _block_to_elements(block):
 # Build PDF
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _img(path, w):
+def _img(path, w, hAlign='LEFT'):
     img = PILImage.open(path)
     iw, ih = img.size
-    return RLImage(path, width=w, height=w * ih / iw)
+    ri = RLImage(path, width=w, height=w * ih / iw)
+    ri.hAlign = hAlign
+    return ri
 
 
 def build_pdf(header_lines, body_lines, out_path, logo_path, luuy_path, verbose=False):
     story = []
 
-    # Logo ~40% width
+    # Logo ~42% width, centered
     if logo_path and os.path.isfile(logo_path):
-        story.append(_img(logo_path, LOGO_W))
+        story.append(_img(logo_path, LOGO_W, hAlign='CENTER'))
         story.append(Spacer(1, 10))
     else:
         print(f"  WARN: logo not found: {logo_path}")
@@ -500,6 +502,9 @@ def build_pdf(header_lines, body_lines, out_path, logo_path, luuy_path, verbose=
 
     for idx, block in enumerate(blocks):
         elems = _block_to_elements(block)
+        # Add spacer between blocks — 2 blank lines worth (~18pt) like sample
+        if idx > 0:
+            story.append(Spacer(1, 16))
         if len(elems) <= 45:
             story.append(KeepTogether(elems))
         else:
