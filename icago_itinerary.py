@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """
-icago_itinerary.py — ICAGO Itinerary Converter v3
-- Logo full content width
-- Bold chi: FLIGHT line, DEPARTURE line, ARRIVAL line (moi cum), BOOKING REF + ten khach
-- DEPARTURE/ARRIVAL: canh trai thong tin chuyen bay, thoi gian canh PHAI
-- Cac dong con lai: normal weight
-- FLIGHT TICKET(S) + TICKET: do dam
+icago_itinerary.py — ICAGO Itinerary Converter v4
+Layout theo mau LE_THI_KIM_THOA_X3:
+  - Logo ~40% width, canh trai
+  - BOOKING REF (bold) + ten khach (bold) sau khoang cach
+  - FLIGHT line: "FLIGHT  UA xxx - AIRLINE         DOW DD MON YYYY"
+    -> col1="FLIGHT" bold | col2=flight info bold | col3=date bold right-align
+  - OPERATED BY: normal, indent
+  - Separator "---": full width
+  - DEPARTURE / ARRIVAL: label bold + location bold | date+time bold right-align
+  - Continuation (TERMINAL 2): normal, indent
+  - FLIGHT BOOKING REF: xoa
+  - RESERVATION CONFIRMED: xoa
+  - BAGGAGE / SEAT / MEAL / EQUIPMENT / NON STOP / AIRCRAFT OWNER / WHEELCHAIR: normal
+  - FLIGHT TICKET(S): do dam, inline voi "---" separator
+  - TICKET: do dam
+  - Luu y: full width
 """
 
-import argparse
-import os
-import re
-import sys
+import argparse, os, re, sys
 
 try:
     import pdfplumber
@@ -21,13 +28,9 @@ except ImportError:
 try:
     from reportlab.lib.pagesizes import letter
     from reportlab.lib import colors
-    from reportlab.lib.units import mm
     from reportlab.platypus import (
-        SimpleDocTemplate, Spacer, Image as RLImage,
-        Flowable, KeepTogether, Table, TableStyle
+        SimpleDocTemplate, Spacer, Image as RLImage, Flowable, KeepTogether
     )
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
 except ImportError:
     sys.exit("pip install reportlab")
 
@@ -37,43 +40,60 @@ except ImportError:
     sys.exit("pip install pillow")
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-_SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_LOGO = os.path.join(_SCRIPT_DIR, "icago_logo.png")
-DEFAULT_LUUY = os.path.join(_SCRIPT_DIR, "icago_luuy.png")
+_DIR         = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_LOGO = os.path.join(_DIR, "icago_logo.png")
+DEFAULT_LUUY = os.path.join(_DIR, "icago_luuy.png")
 
-# ── Layout ─────────────────────────────────────────────────────────────────────
-PAGE_W, PAGE_H = letter
-MARGIN_L  = 46
-MARGIN_R  = 46
-MARGIN_T  = 28
-MARGIN_B  = 28
-CONTENT_W = PAGE_W - MARGIN_L - MARGIN_R   # ~523 pt
+# ── Page / font constants ──────────────────────────────────────────────────────
+PAGE_W, PAGE_H = letter          # 612 x 792 pt
+ML = 46; MR = 46; MT = 24; MB = 28
+CW = PAGE_W - ML - MR            # ~520 pt content width
 
-FONT_NORM = "Courier"
-FONT_BOLD = "Courier-Bold"
-FS        = 8.5          # font size
-LH        = 11.5         # line height
-LH_EMPTY  = 4            # height of blank separator lines
-COLOR_BLACK = colors.black
-COLOR_RED   = colors.HexColor("#CC0000")
+FN   = "Courier"
+FB   = "Courier-Bold"
+FS   = 8.5                        # font size pt
+CW_  = FS * 0.6                   # char width (~5.1 pt)
+LH   = 11.5                       # normal line height
+LHE  = 3                          # empty line height
 
-# Approx char width for Courier at FS (= FS * 0.6)
-CHAR_W = FS * 0.6        # ~5.1 pt per char
+BLACK = colors.black
+RED   = colors.HexColor("#CC0000")
 
-# TIME column width — fits "DD MMM HH:MM" = 12 chars + small pad
-TIME_COL_W = 13 * CHAR_W   # ~66 pt
+# Column widths for FLIGHT header row
+# "FLIGHT" label = 6 chars
+FLIGHT_LABEL_W = 7 * CW_          # ~36 pt
+# Date "DOW DD MON YYYY" = ~16 chars
+FLIGHT_DATE_W  = 17 * CW_         # ~87 pt
+FLIGHT_INFO_W  = CW - FLIGHT_LABEL_W - FLIGHT_DATE_W   # middle
+
+# DEPARTURE/ARRIVAL label width: "DEPARTURE: " = 11 chars, "ARRIVAL:   " = 11
+DEPTARR_LBL_W  = 11 * CW_        # ~56 pt
+DEPTARR_TIME_W = 13 * CW_        # ~66 pt  "DD MMM HH:MM"
+DEPTARR_LOC_W  = CW - DEPTARR_LBL_W - DEPTARR_TIME_W
+
+LOGO_W = CW * 0.38               # ~40% width
 
 # ── Regexes ────────────────────────────────────────────────────────────────────
-_FLIGHT_START_RE  = re.compile(r"^\s*FLIGHT\s+(?!BOOKING|TICKET)", re.I)
-_TICKET_START_RE  = re.compile(r"^\s*FLIGHT\s+TICKET\(S\)",        re.I)
-_DEPARTURE_RE     = re.compile(r"^\s*DEPARTURE\s*:", re.I)
-_ARRIVAL_RE       = re.compile(r"^\s*ARRIVAL\s*:",   re.I)
-_BOOKING_REF_RE   = re.compile(r"FLIGHT\s+BOOKING\s+REF\s*:\s*(\S+)", re.I)
+_FLIGHT_RE    = re.compile(r"^\s*FLIGHT\s+(?!BOOKING|TICKET)", re.I)
+_TICKET_HD_RE = re.compile(r"^\s*FLIGHT\s+TICKET\(S\)",        re.I)
+_OPERATED_RE  = re.compile(r"^\s*OPERATED\s+BY\s*:",           re.I)
+_DEP_RE       = re.compile(r"^\s*DEPARTURE\s*:",               re.I)
+_ARR_RE       = re.compile(r"^\s*ARRIVAL\s*:",                 re.I)
+_SEPARATOR_RE = re.compile(r"^\s*-{5,}",                       re.I)
+_DASHES_RE    = re.compile(r"^\s*[-\s]+$")
+_TICKET_LN_RE = re.compile(r"^\s*TICKET\s*:",                  re.I)
 
-# Lines to BOLD (only these + FLIGHT line + DEPARTURE + ARRIVAL)
-_BOLD_LABELS = re.compile(
-    r"^\s*(FLIGHT\s+(?!BOOKING)|DEPARTURE\s*:|ARRIVAL\s*:)",
-    re.I
+# Trailing date+time: "DD MON HH:MM" or "DD MON YYYY" at end of line (1+ spaces before)
+_TRAIL_TIME_RE = re.compile(
+    r'\s+(\d{1,2}\s+[A-Z]{3}\s+(?:\d{2}:\d{2}|\d{4}))\s*$', re.I
+)
+# FLIGHT line date (right side): "DOW DD MON YYYY"
+_FLIGHT_DATE_RE = re.compile(
+    r'\s{3,}([A-Z]{3}\s+\d{1,2}\s+[A-Z]+\s+\d{4})\s*$', re.I
+)
+# Parse FLIGHT line: "FLIGHT   UA 468 - UNITED AIRLINES      MON 01 JUNE 2026"
+_FLIGHT_PARSE_RE = re.compile(
+    r'^\s*FLIGHT\s+(.*?)\s{3,}([A-Z]{3}\s+\d{1,2}\s+\S+\s+\d{4})\s*$', re.I
 )
 
 _DELETE_RE = [re.compile(p, re.I) for p in [
@@ -97,17 +117,134 @@ _DELETE_RE = [re.compile(p, re.I) for p in [
     r"RIGHTS\s+PLEASE\s+CONTACT\s+YOUR\s+AIR\s+CARRIER",
     r"AGENCY\s+WEBSITE",
     r"CANADIAN\s+TRANSPORTATION",
-    r"RESERVATION\s+CONFIRMED",      # redundant — status shown on ticket
-    r"FLIGHT\s+BOOKING\s+REF\s*:",   # shown in header already
+    r"RESERVATION\s+CONFIRMED",
+    r"FLIGHT\s+BOOKING\s+REF\s*:",
 ]]
 
 
-def _should_delete(line):
+def _del(line):
     return any(rx.search(line.strip()) for rx in _DELETE_RE)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. Extract text from PDF
+# Flowables
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MonoLine(Flowable):
+    """Plain single line. bold/red optional."""
+    def __init__(self, text, bold=False, red=False, indent=0):
+        super().__init__()
+        self.text   = text.rstrip() if text else ""
+        self.bold   = bold or red
+        self.red    = red
+        self.indent = indent
+        self.width  = CW
+        self.height = LHE if not (text or "").strip() else LH
+
+    def draw(self):
+        if not self.text.strip():
+            return
+        self.canv.setFont(FB if self.bold else FN, FS)
+        self.canv.setFillColor(RED if self.red else BLACK)
+        self.canv.drawString(self.indent, 2, self.text)
+        self.canv.setFillColor(BLACK)
+
+
+class FlightLine(Flowable):
+    """
+    FLIGHT  |  UA 468 - UNITED AIRLINES  |  MON 01 JUNE 2026
+    All bold, date right-aligned.
+    """
+    def __init__(self, info, date):
+        super().__init__()
+        self.info  = info.strip()
+        self.date  = date.strip()
+        self.width = CW
+        self.height = LH
+
+    def draw(self):
+        self.canv.setFont(FB, FS)
+        self.canv.setFillColor(BLACK)
+        # "FLIGHT" label
+        self.canv.drawString(0, 2, "FLIGHT")
+        # flight info starting after label col
+        self.canv.drawString(FLIGHT_LABEL_W + 4, 2, self.info)
+        # date flush right
+        dw = self.canv.stringWidth(self.date, FB, FS)
+        self.canv.drawString(CW - dw, 2, self.date)
+
+
+class DepArrLine(Flowable):
+    """
+    DEPARTURE: / ARRIVAL: with location bold left, time bold right.
+    Handles continuation lines (e.g. TERMINAL 2) as plain indented.
+    """
+    def __init__(self, label, location, time_part):
+        """
+        label    : "DEPARTURE:" or "ARRIVAL:"
+        location : rest of the location string
+        time_part: "DD MON HH:MM" or None
+        """
+        super().__init__()
+        self.label     = label.strip()
+        self.location  = location.strip()
+        self.time_part = (time_part or "").strip()
+        self.width  = CW
+        self.height = LH
+
+    def draw(self):
+        self.canv.setFont(FB, FS)
+        self.canv.setFillColor(BLACK)
+        # label
+        lw = self.canv.stringWidth(self.label + " ", FB, FS)
+        self.canv.drawString(0, 2, self.label)
+        # location
+        self.canv.drawString(lw, 2, self.location)
+        # time right-aligned
+        if self.time_part:
+            tw = self.canv.stringWidth(self.time_part, FB, FS)
+            self.canv.drawString(CW - tw, 2, self.time_part)
+
+
+class SepLine(Flowable):
+    """Full-width solid separator line (replaces --- chars)."""
+    def __init__(self, dashes=True):
+        super().__init__()
+        self.dashes = dashes
+        self.width  = CW
+        self.height = LH
+
+    def draw(self):
+        # Draw actual dash characters to match the original style
+        self.canv.setFont(FN, FS)
+        self.canv.setFillColor(BLACK)
+        n_dashes = int(CW / (FS * 0.6))
+        self.canv.drawString(0, 2, "-" * n_dashes)
+
+
+class TicketHeaderLine(Flowable):
+    """FLIGHT TICKET(S) ---- red bold, with dashes to fill the line."""
+    def __init__(self):
+        super().__init__()
+        self.width  = CW
+        self.height = LH
+
+    def draw(self):
+        label = "FLIGHT TICKET(S) "
+        self.canv.setFont(FB, FS)
+        self.canv.setFillColor(RED)
+        self.canv.drawString(0, 2, label)
+        lw = self.canv.stringWidth(label, FB, FS)
+        # fill rest with dashes
+        dash_w = self.canv.stringWidth("-", FN, FS)
+        n = max(0, int((CW - lw) / dash_w))
+        self.canv.setFont(FN, FS)
+        self.canv.drawString(lw, 2, "-" * n)
+        self.canv.setFillColor(BLACK)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Extract
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_pages(pdf_path, verbose=False):
@@ -122,76 +259,59 @@ def extract_pages(pdf_path, verbose=False):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. Parse header (page 1 top section)
+# Parse header (BOOKING REF + passengers)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def parse_header(header_lines, verbose=False):
-    """
-    Extract BOOKING REF and passenger names.
-    Handles two formats:
-      A) "    BOOKING REF: EMN2LW" — direct (no right-column gap)
-      B) "   left col    BOOKING REF: xxx" — two-column with 4+ space gap
-    """
+def parse_header(lines, verbose=False):
     kept = []
-    for line in header_lines:
-        stripped = line.rstrip()
-        s = stripped.strip()
+    for line in lines:
+        s = line.strip()
         if not s:
             continue
-
-        # Format A: line IS the booking ref or passenger name
+        # Direct format
         if re.match(r'^BOOKING\s+REF\s*:', s, re.I):
             val = re.sub(r'(BOOKING\s+REF\s*:\s*)[A-Za-z]{2}/', r'\1', s, flags=re.I)
-            kept.append(val)
-            if verbose:
-                print(f"  [header] ref(A): {repr(val)}")
+            kept.append(val); continue
+        # Passenger name: LASTNAME/FIRSTNAME or with suffix like (Child)
+        if re.match(r'^[A-Z][A-Z-]+/[A-Z]', s):
+            kept.append(s); continue
+        # Two-column layout
+        m = re.match(r'^\s+', line)
+        if not m:
             continue
-        if re.match(r'^[A-Z][A-Z-]+/[A-Z]', s) and '  ' not in s[:30]:
-            kept.append(s)
-            if verbose:
-                print(f"  [header] pax(A): {repr(s)}")
+        rest = line[m.end():]
+        mg = re.search(r'\s{4,}', rest)
+        if not mg:
             continue
-
-        # Format B: two-column layout — find content after 4+ space gap
-        m_indent = re.match(r'^\s+', stripped)
-        content_start = m_indent.end() if m_indent else 0
-        rest = stripped[content_start:]
-        m_gap = re.search(r'\s{4,}', rest)
-        if not m_gap:
-            continue
-        right = rest[m_gap.end():].strip()
+        right = rest[mg.end():].strip()
         if not right:
             continue
         if re.match(r'^DATE\s*:', right, re.I):
             continue
         if re.match(r'^BOOKING\s+REF\s*:', right, re.I):
             right = re.sub(r'(BOOKING\s+REF\s*:\s*)[A-Za-z]{2}/', r'\1', right, flags=re.I)
-            kept.append(right)
-            if verbose:
-                print(f"  [header] ref(B): {repr(right)}")
-            continue
+            kept.append(right); continue
         if re.match(r'^[A-Z-]+/[A-Z]', right):
             kept.append(right)
-            if verbose:
-                print(f"  [header] pax(B): {repr(right)}")
+    if verbose:
+        print(f"  [header] {kept}")
     return kept
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. Clean body lines
+# Clean
 # ══════════════════════════════════════════════════════════════════════════════
 
 def clean_body(lines, verbose=False):
-    result, skip_rest = [], False
+    result, skip = [], False
     for line in lines:
         s = line.strip()
         if re.match(r"Data\s+Protection\s+Notice\s*:", s, re.I):
-            skip_rest = True
-        if skip_rest:
+            skip = True
+        if skip:
             continue
-        if _should_delete(line):
-            if verbose:
-                print(f"  [body] del: {repr(s[:70])}")
+        if _del(line):
+            if verbose: print(f"  [del] {repr(s[:70])}")
             continue
         result.append(line)
     while result and not result[-1].strip():
@@ -200,274 +320,211 @@ def clean_body(lines, verbose=False):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. Process all pages
+# Process pages
 # ══════════════════════════════════════════════════════════════════════════════
 
 def process_pages(pages, verbose=False):
-    header_lines   = []
-    all_body_lines = []
-
-    for idx, page_text in enumerate(pages):
-        lines = page_text.split("\n")
+    header_lines = []
+    all_body     = []
+    for idx, text in enumerate(pages):
+        lines = text.split("\n")
         if idx == 0:
-            flight_idx = next(
+            fi = next(
                 (i for i, l in enumerate(lines)
-                 if re.search(r'FLIGHT\s+', l)
-                 and not re.search(r'FLIGHT\s+BOOKING', l)),
-                len(lines),
+                 if re.search(r'FLIGHT\s+', l) and not re.search(r'FLIGHT\s+BOOKING', l)),
+                len(lines)
             )
-            header_lines = parse_header(lines[:flight_idx], verbose)
-            page_body    = clean_body(lines[flight_idx:], verbose)
+            header_lines = parse_header(lines[:fi], verbose)
+            body = clean_body(lines[fi:], verbose)
         else:
-            page_body = clean_body(lines, verbose)
-
-        all_body_lines.extend(page_body)
-
-    return header_lines, all_body_lines
+            body = clean_body(lines, verbose)
+        all_body.extend(body)
+    return header_lines, all_body
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5. Line classification
+# Group into blocks
 # ══════════════════════════════════════════════════════════════════════════════
 
-def is_flight_start(line):
-    return bool(_FLIGHT_START_RE.match(line))
-
-def is_ticket_start(line):
-    return bool(_TICKET_START_RE.match(line))
-
-def is_departure(line):
-    return bool(_DEPARTURE_RE.match(line.strip()))
-
-def is_arrival(line):
-    return bool(_ARRIVAL_RE.match(line.strip()))
-
-def is_ticket_line(line):
-    s = line.strip()
-    return (re.match(r"FLIGHT\s+TICKET\(S\)", s, re.I) or
-            re.match(r"TICKET\s*:", s, re.I) or
-            re.match(r"[A-Z]{2}/ETKT\s", s, re.I))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 6. Group into flight blocks
-# ══════════════════════════════════════════════════════════════════════════════
-
-def group_into_blocks(body_lines):
-    blocks, current = [], []
+def group_blocks(body_lines):
+    blocks, cur = [], []
     for line in body_lines:
-        if is_flight_start(line) or is_ticket_start(line):
-            if current:
-                blocks.append(current)
-            current = [line]
+        s = line.strip()
+        if _FLIGHT_RE.match(line) or _TICKET_HD_RE.match(s):
+            if cur: blocks.append(cur)
+            cur = [line]
         else:
-            current.append(line)
-    if current:
-        blocks.append(current)
+            cur.append(line)
+    if cur: blocks.append(cur)
     return blocks
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7. Flowables
+# Parse DEPARTURE / ARRIVAL line
 # ══════════════════════════════════════════════════════════════════════════════
 
-class MonoLine(Flowable):
-    """Single line, monospace, with optional bold/red."""
-    def __init__(self, text, bold=False, red=False):
-        super().__init__()
-        self.text   = text.rstrip()
-        self.bold   = bold or red
-        self.red    = red
-        self.width  = CONTENT_W
-        self.height = LH_EMPTY if not self.text.strip() else LH
-
-    def draw(self):
-        if not self.text.strip():
-            return
-        font  = FONT_BOLD if self.bold else FONT_NORM
-        color = COLOR_RED if self.red else COLOR_BLACK
-        self.canv.setFont(font, FS)
-        self.canv.setFillColor(color)
-        self.canv.drawString(0, 2, self.text)
-        self.canv.setFillColor(COLOR_BLACK)
-
-
-class DepArrLine(Flowable):
+def _parse_dep_arr(raw):
     """
-    DEPARTURE / ARRIVAL line: label+location flush left, date+time flush right.
-    Bold, black.
-
-    Raw line looks like (spaces preserved from pdfplumber layout=True):
-       " DEPARTURE: NEWARK, NJ (NEWARK LIBERTY INTL), TERMINAL C 03 JUN 10:30"
-       " ARRIVAL:   TOKYO, JP (TOKYO INTL HANEDA), TERMINAL 3     04 JUN 13:35"
-
-    We split on the trailing datetime pattern: "DD MMM HH:MM" or "DD MON YYYY"
+    Returns (label, location, time_str)
+    e.g. "DEPARTURE: ORLANDO, FL (ORLANDO INTL), TERMINAL B   01 JUN 07:00"
+    -> ("DEPARTURE:", "ORLANDO, FL (ORLANDO INTL), TERMINAL B", "01 JUN 07:00")
     """
-    _TIME_RE = re.compile(
-        r'(\s+(\d{1,2}\s+[A-Z]{3}\s+\d{2}:\d{2}|\d{1,2}\s+[A-Z]{3}\s+\d{4}))\s*$',
-        re.I
-    )
-
-    def __init__(self, text, continuation=False):
-        """
-        continuation=True: this is an indented continuation line (e.g. TERMINAL 2),
-        rendered as normal (non-bold) plain line indented to match body.
-        """
-        super().__init__()
-        self.raw          = text.rstrip()
-        self.continuation = continuation
-        self.width        = CONTENT_W
-        self.height       = LH
-
-    def _split_time(self, s):
-        """Return (left_part, time_part) or (s, None)."""
-        m = self._TIME_RE.search(s)
-        if m:
-            return s[:m.start()].strip(), m.group(2) if m.group(2) else m.group(1).strip()
-        return s.strip(), None
-
-    def draw(self):
-        s = self.raw.strip()
-        if self.continuation:
-            # Indented continuation — normal weight, small indent
-            self.canv.setFont(FONT_NORM, FS)
-            self.canv.setFillColor(COLOR_BLACK)
-            self.canv.drawString(12, 2, s)
-            return
-
-        left, time_part = self._split_time(s)
-        self.canv.setFont(FONT_BOLD, FS)
-        self.canv.setFillColor(COLOR_BLACK)
-        self.canv.drawString(0, 2, left)
-        if time_part:
-            tw = self.canv.stringWidth(time_part, FONT_BOLD, FS)
-            self.canv.drawString(CONTENT_W - tw, 2, time_part)
+    s = raw.strip()
+    # Split label
+    m = re.match(r'^(DEPARTURE:|ARRIVAL:)\s*', s, re.I)
+    if not m:
+        return None, s, None
+    label = m.group(1).upper()
+    rest  = s[m.end():]
+    # Extract trailing time
+    mt = _TRAIL_TIME_RE.search(rest)
+    if mt:
+        time_str = mt.group(1)
+        location = rest[:mt.start()].strip()
+    else:
+        time_str = None
+        location = rest.strip()
+    return label, location, time_str
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8. Build one block into Flowable list
+# Build one block -> list of Flowables
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _build_block_elements(block):
-    """
-    Render rules:
-    - FLIGHT line: BOLD
-    - DEPARTURE line: DepArrLine (bold, time right-aligned)
-    - ARRIVAL line: DepArrLine (bold, time right-aligned)
-    - Lines immediately after DEPARTURE/ARRIVAL that have no label (continuation): DepArrLine(continuation=True)
-    - OPERATED BY: normal
-    - dashes (---) : normal
-    - RESERVATION CONFIRMED, BAGGAGE, MEAL, EQUIPMENT, NON STOP, etc.: normal
-    - FLIGHT BOOKING REF inside block: normal (drop it — redundant)
-    - FLIGHT TICKET(S), TICKET:: red bold
-    - Everything else: normal
-    """
+def _block_to_elements(block):
     elements = []
-    after_dep_arr = False   # True for 1 line after DEPARTURE/ARRIVAL (catch continuation)
+    after_dep_arr = False
 
     for raw in block:
         s = raw.strip()
-
-        # Blank / separator line
-        if not s or re.match(r'^[-\s]+$', s):
-            elements.append(MonoLine(raw, bold=False))
+        if not s:
+            elements.append(MonoLine(""))
             after_dep_arr = False
             continue
 
-        # FLIGHT TICKET(S) or TICKET: — red
-        if is_ticket_line(s):
+        # ── FLIGHT TICKET(S) header ──────────────────────────────────────────
+        if _TICKET_HD_RE.match(s):
+            elements.append(TicketHeaderLine())
+            after_dep_arr = False
+            continue
+
+        # ── TICKET: line ─────────────────────────────────────────────────────
+        if _TICKET_LN_RE.match(s):
             elements.append(MonoLine(s, red=True))
             after_dep_arr = False
             continue
 
-        # DEPARTURE / ARRIVAL — bold, time right-aligned
-        if is_departure(s) or is_arrival(s):
-            elements.append(DepArrLine(raw, continuation=False))
+        # ── Solid separator ------ ────────────────────────────────────────────
+        if _SEPARATOR_RE.match(raw) and not _DASHES_RE.match(raw):
+            elements.append(SepLine())
+            after_dep_arr = False
+            continue
+
+        # ── Dotted separator - - - ────────────────────────────────────────────
+        if _DASHES_RE.match(s):
+            elements.append(MonoLine(s))
+            after_dep_arr = False
+            continue
+
+        # ── FLIGHT line ───────────────────────────────────────────────────────
+        if _FLIGHT_RE.match(raw):
+            m = _FLIGHT_PARSE_RE.match(raw)
+            if m:
+                elements.append(FlightLine(m.group(1), m.group(2)))
+            else:
+                elements.append(MonoLine(s, bold=True))
+            after_dep_arr = False
+            continue
+
+        # ── OPERATED BY ───────────────────────────────────────────────────────
+        if _OPERATED_RE.match(s):
+            elements.append(MonoLine(s, indent=FLIGHT_LABEL_W + 4))
+            after_dep_arr = False
+            continue
+
+        # ── DEPARTURE / ARRIVAL ───────────────────────────────────────────────
+        if _DEP_RE.match(s) or _ARR_RE.match(s):
+            label, location, time_str = _parse_dep_arr(s)
+            elements.append(DepArrLine(label, location, time_str))
             after_dep_arr = True
             continue
 
-        # Continuation line after DEPARTURE/ARRIVAL (e.g. "TERMINAL 2")
-        if after_dep_arr and not re.match(r'[A-Z ]+\s*:', s, re.I) and not is_flight_start(raw):
-            elements.append(DepArrLine(raw, continuation=True))
-            # Keep after_dep_arr True in case of multi-line continuation
+        # ── Continuation after DEP/ARR (e.g. TERMINAL 2) ─────────────────────
+        if after_dep_arr and not re.match(r'[A-Z ]+\s*:', s) and not _FLIGHT_RE.match(raw):
+            elements.append(MonoLine(s, indent=DEPTARR_LBL_W))
             continue
         else:
             after_dep_arr = False
 
-        # FLIGHT line (not BOOKING, not TICKET) — bold
-        if is_flight_start(raw):
-            elements.append(MonoLine(s, bold=True))
-            continue
-
-        # Everything else — normal
-        elements.append(MonoLine(s, bold=False))
+        # ── Everything else: normal ───────────────────────────────────────────
+        elements.append(MonoLine(s))
 
     return elements
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 9. Build full PDF
+# Build PDF
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _scaled_image(path, width):
+def _img(path, w):
     img = PILImage.open(path)
-    w, h = img.size
-    return RLImage(path, width=width, height=width * h / w)
+    iw, ih = img.size
+    return RLImage(path, width=w, height=w * ih / iw)
 
 
-def build_pdf(header_lines, body_lines, output_path, logo_path, luuy_path, verbose=False):
+def build_pdf(header_lines, body_lines, out_path, logo_path, luuy_path, verbose=False):
     story = []
 
-    # ── Logo: full content width ──────────────────────────────────────────────
+    # Logo ~40% width
     if logo_path and os.path.isfile(logo_path):
-        story.append(_scaled_image(logo_path, CONTENT_W))
-        story.append(Spacer(1, 8))
+        story.append(_img(logo_path, LOGO_W))
+        story.append(Spacer(1, 10))
     else:
-        print(f"  WARNING: logo not found: {logo_path}")
+        print(f"  WARN: logo not found: {logo_path}")
 
-    # ── Header: BOOKING REF (bold) + passenger names (bold) ──────────────────
-    for line in header_lines:
-        story.append(MonoLine(line, bold=True))
-    story.append(Spacer(1, 7))
+    # BOOKING REF (bold) + blank line + passengers (bold)
+    booking_lines = [l for l in header_lines if re.match(r'^BOOKING\s+REF', l, re.I)]
+    pax_lines     = [l for l in header_lines if not re.match(r'^BOOKING\s+REF', l, re.I)]
+    for l in booking_lines:
+        story.append(MonoLine(l, bold=True))
+    if pax_lines:
+        story.append(Spacer(1, 4))
+        for l in pax_lines:
+            story.append(MonoLine(l, bold=True))
+    story.append(Spacer(1, 8))
 
-    # ── Body blocks ───────────────────────────────────────────────────────────
-    blocks = group_into_blocks(body_lines)
+    # Flight blocks
+    blocks = group_blocks(body_lines)
     if verbose:
-        print(f"  [build] {len(blocks)} block(s)")
+        print(f"  [build] {len(blocks)} blocks")
 
-    for block_idx, block in enumerate(blocks):
-        elements = _build_block_elements(block)
-
-        # KeepTogether to avoid splitting a flight block across pages
-        if len(elements) <= 45:
-            story.append(KeepTogether(elements))
+    for idx, block in enumerate(blocks):
+        elems = _block_to_elements(block)
+        if len(elems) <= 45:
+            story.append(KeepTogether(elems))
         else:
-            mid = len(elements) // 2
-            story.append(KeepTogether(elements[:mid]))
-            story.append(KeepTogether(elements[mid:]))
-
+            mid = len(elems) // 2
+            story.append(KeepTogether(elems[:mid]))
+            story.append(KeepTogether(elems[mid:]))
         if verbose:
-            print(f"  block {block_idx+1}: {len(block)} lines")
+            print(f"  block {idx+1}: {len(block)} lines -> {len(elems)} elements")
 
-    # ── Luu y image ───────────────────────────────────────────────────────────
-    story.append(Spacer(1, 12))
+    # Luu y image
+    story.append(Spacer(1, 14))
     if luuy_path and os.path.isfile(luuy_path):
-        story.append(_scaled_image(luuy_path, CONTENT_W))
+        story.append(_img(luuy_path, CW))
     else:
-        print(f"  WARNING: luuy image not found: {luuy_path}")
+        print(f"  WARN: luuy not found: {luuy_path}")
 
     SimpleDocTemplate(
-        output_path,
-        pagesize=letter,
-        leftMargin=MARGIN_L,
-        rightMargin=MARGIN_R,
-        topMargin=MARGIN_T,
-        bottomMargin=MARGIN_B,
+        out_path, pagesize=letter,
+        leftMargin=ML, rightMargin=MR,
+        topMargin=MT, bottomMargin=MB,
     ).build(story)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 10. Public API
+# Public API
 # ══════════════════════════════════════════════════════════════════════════════
 
 def convert(input_path, output_path, logo_path=DEFAULT_LOGO, luuy_path=DEFAULT_LUUY, verbose=False):
@@ -480,7 +537,7 @@ def convert(input_path, output_path, logo_path=DEFAULT_LOGO, luuy_path=DEFAULT_L
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 11. CLI
+# CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_args():
@@ -499,7 +556,7 @@ def main():
     output = args.output_file or args.output or \
              os.path.splitext(args.input)[0] + "_ICAGO.pdf"
     convert(args.input, output, args.logo, args.luuy, args.verbose)
-    print(f"Done: {output} ({os.path.getsize(output)//1024} KB)")
+    print(f"Done -> {output} ({os.path.getsize(output)//1024} KB)")
 
 
 if __name__ == "__main__":
