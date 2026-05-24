@@ -439,6 +439,10 @@ async def handle_other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # PTB Application
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PTB Application — lazy init (tránh 409 Conflict khi gunicorn fork)
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _build_ptb() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -450,31 +454,55 @@ def _build_ptb() -> Application:
     return app
 
 
-# Khởi tạo PTB trong loop riêng
-_ptb = _build_ptb()
-run_async(_ptb.initialize(), timeout=30)
-run_async(_ptb.start(),      timeout=30)
-log.info("✅ PTB initialized")
+# PTB instance — được khởi tạo lazy khi request đầu tiên đến
+_ptb: Application | None = None
+_ptb_lock = threading.Lock()
+_ptb_ready = False
 
-# Tự động set webhook
-if WEBHOOK_URL:
-    try:
-        run_async(
-            _ptb.bot.set_webhook(
-                url=WEBHOOK_URL,
-                allowed_updates=["message", "edited_message", "callback_query"],
-                drop_pending_updates=True,
-            ),
-            timeout=20,
-        )
-        log.info(f"✅ Webhook set → {WEBHOOK_URL}")
-    except Exception as e:
-        log.error(f"⚠️ Set webhook lỗi: {e}")
-else:
-    log.warning("⚠️ RENDER_URL chưa set — bật /set_webhook sau khi có URL")
 
-# Khởi động self-ping
-start_self_ping()
+def _ensure_ptb():
+    """
+    Khởi tạo PTB đúng một lần duy nhất, thread-safe.
+    Gọi ở đầu mỗi Flask route thay vì ở module level
+    để tránh gunicorn fork chạy 2 lần → 409 Conflict.
+    """
+    global _ptb, _ptb_ready
+    if _ptb_ready:
+        return _ptb
+    with _ptb_lock:
+        if _ptb_ready:
+            return _ptb
+        log.info("🔧 Khởi tạo PTB lần đầu...")
+        _ptb = _build_ptb()
+        run_async(_ptb.initialize(), timeout=30)
+        run_async(_ptb.start(),      timeout=30)
+        log.info("✅ PTB initialized")
+
+        # Xóa webhook polling cũ (nếu có) rồi set lại
+        try:
+            run_async(_ptb.bot.delete_webhook(drop_pending_updates=True), timeout=10)
+        except Exception:
+            pass
+
+        if WEBHOOK_URL:
+            try:
+                run_async(
+                    _ptb.bot.set_webhook(
+                        url=WEBHOOK_URL,
+                        allowed_updates=["message", "edited_message", "callback_query"],
+                        drop_pending_updates=True,
+                    ),
+                    timeout=20,
+                )
+                log.info(f"✅ Webhook set → {WEBHOOK_URL}")
+            except Exception as e:
+                log.error(f"⚠️ Set webhook lỗi: {e}")
+        else:
+            log.warning("⚠️ RENDER_URL chưa set")
+
+        _ptb_ready = True
+        start_self_ping()
+    return _ptb
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -487,21 +515,22 @@ flask_app = Flask(__name__)
 @flask_app.route("/", methods=["GET"])
 def health():
     """Health check + trạng thái webhook."""
+    ptb = _ensure_ptb()
     try:
-        info = run_async(_ptb.bot.get_webhook_info(), timeout=10)
-        wh   = info.url or "❌ chưa set"
-        err  = info.last_error_message or "none"
+        info = run_async(ptb.bot.get_webhook_info(), timeout=10)
+        wh      = info.url or "❌ chưa set"
+        err     = info.last_error_message or "none"
         pending = info.pending_update_count
     except Exception as e:
         wh, err, pending = "error", str(e), -1
 
     return jsonify({
-        "status":       "✅ running",
-        "webhook":      wh,
-        "pending":      pending,
-        "last_error":   err,
-        "pnr_enabled":  PNR_ENABLED,
-        "docx_enabled": DOCX_ENABLED,
+        "status":        "✅ running",
+        "webhook":       wh,
+        "pending":       pending,
+        "last_error":    err,
+        "pnr_enabled":   PNR_ENABLED,
+        "docx_enabled":  DOCX_ENABLED,
         "ping_interval": f"{PING_INTERVAL}s",
     })
 
@@ -509,10 +538,11 @@ def health():
 @flask_app.route(WEBHOOK_PATH, methods=["POST"])
 def webhook():
     """Nhận update từ Telegram."""
+    ptb    = _ensure_ptb()
     data   = flask_req.get_json(force=True)
-    update = Update.de_json(data, _ptb.bot)
+    update = Update.de_json(data, ptb.bot)
     try:
-        run_async(_ptb.process_update(update), timeout=60)
+        run_async(ptb.process_update(update), timeout=60)
     except Exception as e:
         log.exception(f"Lỗi process_update: {e}")
     return "ok", 200
@@ -520,12 +550,13 @@ def webhook():
 
 @flask_app.route("/set_webhook", methods=["GET"])
 def set_webhook_route():
-    """Set/reset webhook thủ công — truy cập URL này trên trình duyệt."""
+    """Set/reset webhook thủ công."""
     if not WEBHOOK_URL:
         return jsonify({"error": "RENDER_URL chưa set trong Environment"}), 400
+    ptb = _ensure_ptb()
     try:
         run_async(
-            _ptb.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True),
+            ptb.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True),
             timeout=15,
         )
         return jsonify({"ok": True, "webhook": WEBHOOK_URL})
@@ -588,10 +619,6 @@ def debug_browserless():
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # Dừng PTB đã init ở trên, khởi động lại bằng run_polling
-    run_async(_ptb.stop(), timeout=10)
-    _loop.call_soon_threadsafe(_loop.stop)
-
     log.info("🤖 Local polling mode...")
     local_app = _build_ptb()
     local_app.run_polling(allowed_updates=Update.ALL_TYPES)
