@@ -81,8 +81,13 @@ LUUY_PATH  = os.environ.get("LUUY_PATH", DEFAULT_LUUY)
 MAX_MB     = int(os.environ.get("MAX_MB", "20"))
 RENDER_URL = os.environ.get("RENDER_URL", "").rstrip("/")
 PORT       = int(os.environ.get("PORT", "10000"))
-# Interval tự ping (giây). Render sleep sau 15 phút → ping mỗi 10 phút
+
+# Render free tier sleep sau ~15 phút không có request.
+# Ping mỗi 10 phút (600s) để giữ alive. Có thể override qua env.
 PING_INTERVAL = int(os.environ.get("PING_INTERVAL", str(10 * 60)))
+
+# Số lần ping thất bại liên tiếp trước khi log CRITICAL
+PING_FAIL_THRESHOLD = int(os.environ.get("PING_FAIL_THRESHOLD", "3"))
 
 if not BOT_TOKEN:
     sys.exit("❌ Chưa set BOT_TOKEN trong Environment Variables!")
@@ -90,41 +95,107 @@ if not BOT_TOKEN:
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL  = f"{RENDER_URL}{WEBHOOK_PATH}" if RENDER_URL else ""
 
-# ── State lưu file đang chờ đặt tên (user_id → {file_id, file_name, is_docx, default_name}) ──
+# ── State lưu file đang chờ đặt tên ──────────────────────────────────────────
 _pending_input: dict[int, dict] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Self-ping — giữ Render không sleep
+# Keep-Alive — chống Render sleep
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _self_ping_loop():
+class KeepAlive:
     """
-    Gọi chính URL Render mỗi PING_INTERVAL giây để tránh bị sleep.
-    Chạy trong daemon thread riêng — không ảnh hưởng bot.
+    Tự động ping RENDER_URL/ping mỗi PING_INTERVAL giây.
+
+    Cải tiến so với phiên bản cũ:
+    - Ping /ping thay vì / (nhẹ hơn, không gọi get_webhook_info)
+    - Đếm fail liên tiếp, log CRITICAL khi vượt ngưỡng
+    - Retry nhanh (30s) sau lần fail đầu, tránh mất kết nối dài
+    - Exponential backoff khi fail liên tiếp (tối đa 5 phút)
+    - Tự reset về interval bình thường sau khi ping thành công trở lại
+    - Cung cấp last_status để health endpoint hiển thị
     """
-    if not RENDER_URL or not _requests:
-        log.info("Self-ping: tắt (RENDER_URL chưa set hoặc thiếu requests)")
-        return
 
-    ping_url = f"{RENDER_URL}/"
-    log.info(f"Self-ping: bắt đầu, interval={PING_INTERVAL}s → {ping_url}")
+    def __init__(self):
+        self.last_ping_time: float = 0
+        self.last_ping_ok: bool | None = None
+        self.consecutive_fails: int = 0
+        self._thread: threading.Thread | None = None
 
-    # Chờ server khởi động hoàn tất rồi mới bắt đầu ping
-    time.sleep(30)
+    def start(self):
+        if not RENDER_URL:
+            log.info("KeepAlive: tắt — RENDER_URL chưa set")
+            return
+        if not _requests:
+            log.warning("KeepAlive: tắt — thiếu thư viện requests")
+            return
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="keep-alive"
+        )
+        self._thread.start()
+        log.info(f"KeepAlive: ✅ bắt đầu, interval={PING_INTERVAL}s")
 
-    while True:
+    def _loop(self):
+        ping_url = f"{RENDER_URL}/ping"
+
+        # Chờ server khởi động xong trước khi ping lần đầu
+        log.info("KeepAlive: chờ 30s cho server khởi động...")
+        time.sleep(30)
+
+        while True:
+            wait = self._do_ping(ping_url)
+            time.sleep(wait)
+
+    def _do_ping(self, url: str) -> float:
+        """Thực hiện 1 ping, trả về số giây cần sleep trước lần tiếp theo."""
         try:
-            r = _requests.get(ping_url, timeout=10)
-            log.info(f"Self-ping: ✅ {r.status_code} ({r.elapsed.total_seconds():.1f}s)")
+            r = _requests.get(url, timeout=15)
+            r.raise_for_status()
+            elapsed = r.elapsed.total_seconds()
+
+            if self.consecutive_fails > 0:
+                log.info(
+                    f"KeepAlive: ✅ khôi phục sau {self.consecutive_fails} lần thất bại "
+                    f"({r.status_code}, {elapsed:.1f}s)"
+                )
+            else:
+                log.info(f"KeepAlive: ✅ {r.status_code} ({elapsed:.1f}s)")
+
+            self.consecutive_fails = 0
+            self.last_ping_ok = True
+            self.last_ping_time = time.time()
+            return PING_INTERVAL
+
         except Exception as e:
-            log.warning(f"Self-ping: ⚠️ lỗi — {e}")
-        time.sleep(PING_INTERVAL)
+            self.consecutive_fails += 1
+            self.last_ping_ok = False
+            self.last_ping_time = time.time()
+
+            if self.consecutive_fails >= PING_FAIL_THRESHOLD:
+                log.critical(
+                    f"KeepAlive: ❌ thất bại {self.consecutive_fails} lần liên tiếp — {e}"
+                )
+            else:
+                log.warning(f"KeepAlive: ⚠️ lần {self.consecutive_fails} — {e}")
+
+            # Backoff: 30s, 60s, 120s, 240s, … tối đa 300s
+            backoff = min(30 * (2 ** (self.consecutive_fails - 1)), 300)
+            log.info(f"KeepAlive: retry sau {backoff}s")
+            return backoff
+
+    @property
+    def status(self) -> dict:
+        if self.last_ping_time == 0:
+            return {"state": "pending"}
+        ago = int(time.time() - self.last_ping_time)
+        return {
+            "state":             "ok" if self.last_ping_ok else "error",
+            "last_ping_ago_sec": ago,
+            "consecutive_fails": self.consecutive_fails,
+        }
 
 
-def start_self_ping():
-    t = threading.Thread(target=_self_ping_loop, daemon=True, name="self-ping")
-    t.start()
+_keep_alive = KeepAlive()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -168,7 +239,6 @@ def looks_like_pnr(text: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _sanitize_filename(name: str) -> str:
-    """Làm sạch tên file, bỏ ký tự không hợp lệ."""
     safe = re.sub(r'[\\/*?:"<>|]', '_', name).strip().rstrip('.')
     return safe or "output"
 
@@ -205,10 +275,6 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Nhận file PDF hoặc DOCX.
-    Hỏi tên file output TRƯỚC khi xử lý.
-    """
     doc = update.message.document
     fname_lower = doc.file_name.lower()
     is_pdf  = fname_lower.endswith(".pdf")
@@ -231,16 +297,14 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     file_type = "Word (.docx)" if is_docx else "PDF"
     default_name = Path(doc.file_name).stem + "_ICAGO"
 
-    # Xóa pending cũ nếu có (user gửi file mới trước khi xử lý file cũ)
     _pending_input.pop(user_id, None)
-
-    # Lưu thông tin file vào pending_input — chờ user đặt tên
     _pending_input[user_id] = {
-        "file_id":    doc.file_id,
-        "file_name":  doc.file_name,
-        "is_docx":    is_docx,
-        "file_type":  file_type,
+        "file_id":      doc.file_id,
+        "file_name":    doc.file_name,
+        "is_docx":      is_docx,
+        "file_type":    file_type,
         "default_name": default_name,
+        "received_at":  time.time(),   # ← dùng để phát hiện pending hết hạn
     }
 
     log.info(f"📥 Nhận {file_type}: {doc.file_name} từ {update.effective_user.full_name} — chờ đặt tên")
@@ -261,10 +325,6 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _process_and_send(update_or_query, ctx, user_id: int, output_name: str):
-    """
-    Download file, chuyển đổi, rồi gửi PDF về cho user.
-    Dùng cho cả callback (nút mặc định) lẫn nhập tên thủ công.
-    """
     pending = _pending_input.pop(user_id, None)
     if not pending:
         msg = "❌ Không tìm thấy file đang chờ. Vui lòng gửi lại file."
@@ -277,11 +337,10 @@ async def _process_and_send(update_or_query, ctx, user_id: int, output_name: str
     if not output_name.lower().endswith(".pdf"):
         output_name += ".pdf"
 
-    file_type    = pending["file_type"]
-    is_docx      = pending["is_docx"]
+    file_type     = pending["file_type"]
+    is_docx       = pending["is_docx"]
     original_name = pending["file_name"]
 
-    # Thông báo đang xử lý
     if hasattr(update_or_query, 'message') and update_or_query.message:
         status = await update_or_query.message.reply_text(
             f"⏳ Đang xử lý *{file_type}*: `{original_name}` → `{output_name}`...",
@@ -289,7 +348,6 @@ async def _process_and_send(update_or_query, ctx, user_id: int, output_name: str
         )
         send_doc_to = update_or_query.message
     else:
-        # Callback query
         await update_or_query.edit_message_text(
             f"⏳ Đang xử lý *{file_type}*: `{original_name}` → `{output_name}`...",
             parse_mode="Markdown"
@@ -308,21 +366,18 @@ async def _process_and_send(update_or_query, ctx, user_id: int, output_name: str
         inp    = os.path.join(tmp, f"input{ext_in}")
         out    = os.path.join(tmp, output_name)
 
-        # Download file từ Telegram
         tgf = await ctx.bot.get_file(pending["file_id"])
         await tgf.download_to_drive(inp)
 
-        # Chuyển đổi
         if is_docx:
             convert_docx(inp, out, logo_path=LOGO_PATH, luuy_path=LUUY_PATH)
         else:
             convert(inp, out, logo_path=LOGO_PATH, luuy_path=LUUY_PATH)
 
         size_kb = os.path.getsize(out) // 1024
+        caption = f"✅ Hoàn thành! ({size_kb} KB)\n📄 {output_name}"
 
-        # Gửi file PDF
         with open(out, "rb") as f:
-            caption = f"✅ Hoàn thành! ({size_kb} KB)\n📄 {output_name}"
             if send_doc_to:
                 await send_doc_to.reply_document(
                     document=f, filename=output_name, caption=caption
@@ -358,7 +413,6 @@ async def _process_and_send(update_or_query, ctx, user_id: int, output_name: str
 
 
 async def handle_name_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Xử lý khi user nhấn nút 'Dùng tên mặc định'."""
     query = update.callback_query
     await query.answer()
     parts = query.data.split("|")
@@ -382,9 +436,14 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
 
-    # ── Ưu tiên 1: user đang nhập tên file output cho file vừa gửi ────────────
+    # ── Ưu tiên 1: user đang nhập tên file output ─────────────────────────────
     if user_id in _pending_input:
-        if not looks_like_pnr(text) and len(text) < 200 and '\n' not in text:
+        pending = _pending_input[user_id]
+        # Bỏ qua nếu pending quá cũ (> 10 phút) — tránh nhận nhầm tin nhắn sau khi bot restart
+        age = time.time() - pending.get("received_at", 0)
+        if age > 600:
+            _pending_input.pop(user_id, None)
+        elif not looks_like_pnr(text) and len(text) < 200 and '\n' not in text:
             safe_name = _sanitize_filename(text)
             if not safe_name:
                 await update.message.reply_text("❌ Tên file không hợp lệ. Vui lòng nhập lại.")
@@ -436,11 +495,7 @@ async def handle_other(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PTB Application
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PTB Application — lazy init (tránh 409 Conflict khi gunicorn fork)
+# PTB Application — lazy init
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_ptb() -> Application:
@@ -454,18 +509,12 @@ def _build_ptb() -> Application:
     return app
 
 
-# PTB instance — được khởi tạo lazy khi request đầu tiên đến
 _ptb: Application | None = None
-_ptb_lock = threading.Lock()
+_ptb_lock  = threading.Lock()
 _ptb_ready = False
 
 
 def _ensure_ptb():
-    """
-    Khởi tạo PTB đúng một lần duy nhất, thread-safe.
-    Gọi ở đầu mỗi Flask route thay vì ở module level
-    để tránh gunicorn fork chạy 2 lần → 409 Conflict.
-    """
     global _ptb, _ptb_ready
     if _ptb_ready:
         return _ptb
@@ -478,7 +527,6 @@ def _ensure_ptb():
         run_async(_ptb.start(),      timeout=30)
         log.info("✅ PTB initialized")
 
-        # Xóa webhook polling cũ (nếu có) rồi set lại
         try:
             run_async(_ptb.bot.delete_webhook(drop_pending_updates=True), timeout=10)
         except Exception:
@@ -498,15 +546,18 @@ def _ensure_ptb():
             except Exception as e:
                 log.error(f"⚠️ Set webhook lỗi: {e}")
         else:
-            log.warning("⚠️ RENDER_URL chưa set")
+            log.warning("⚠️ RENDER_URL chưa set — webhook không hoạt động")
 
         _ptb_ready = True
-        start_self_ping()
+
+        # ── Khởi động KeepAlive SAU KHI PTB đã sẵn sàng ──────────────────────
+        _keep_alive.start()
+
     return _ptb
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Flask app (gunicorn bot:flask_app)
+# Flask app
 # ══════════════════════════════════════════════════════════════════════════════
 
 flask_app = Flask(__name__)
@@ -514,10 +565,10 @@ flask_app = Flask(__name__)
 
 @flask_app.route("/", methods=["GET"])
 def health():
-    """Health check + trạng thái webhook."""
+    """Health check + trạng thái webhook + keep-alive."""
     ptb = _ensure_ptb()
     try:
-        info = run_async(ptb.bot.get_webhook_info(), timeout=10)
+        info    = run_async(ptb.bot.get_webhook_info(), timeout=10)
         wh      = info.url or "❌ chưa set"
         err     = info.last_error_message or "none"
         pending = info.pending_update_count
@@ -531,8 +582,18 @@ def health():
         "last_error":    err,
         "pnr_enabled":   PNR_ENABLED,
         "docx_enabled":  DOCX_ENABLED,
+        "keep_alive":    _keep_alive.status,
         "ping_interval": f"{PING_INTERVAL}s",
     })
+
+
+@flask_app.route("/ping", methods=["GET"])
+def ping():
+    """
+    Endpoint nhẹ cho KeepAlive tự ping.
+    Trả về 200 + timestamp — KHÔNG gọi Telegram API.
+    """
+    return jsonify({"ok": True, "ts": int(time.time())}), 200
 
 
 @flask_app.route(WEBHOOK_PATH, methods=["POST"])
@@ -564,24 +625,17 @@ def set_webhook_route():
         return jsonify({"error": str(e)}), 500
 
 
-@flask_app.route("/ping", methods=["GET"])
-def ping():
-    """Endpoint đơn giản cho self-ping."""
-    return "pong", 200
-
-
 @flask_app.route("/debug_browserless", methods=["GET"])
 def debug_browserless():
-    """Test kết nối Browserless — truy cập URL này để kiểm tra."""
+    """Test kết nối Browserless."""
     token = os.environ.get("BROWSERLESS_TOKEN", "")
     if not token:
         return jsonify({"error": "BROWSERLESS_TOKEN chưa set"}), 400
 
     results = {}
-
     endpoints = {
-        "v2_sfo":  f"wss://production-sfo.browserless.io?token={token}",
-        "v2_lon":  f"wss://production-lon.browserless.io?token={token}",
+        "v2_sfo":    f"wss://production-sfo.browserless.io?token={token}",
+        "v2_lon":    f"wss://production-lon.browserless.io?token={token}",
         "v1_legacy": f"wss://chrome.browserless.io?token={token}",
     }
 
@@ -608,9 +662,9 @@ def debug_browserless():
         return jsonify({"error": str(e)}), 500
 
     return jsonify({
-        "token_set": bool(token),
+        "token_set":     bool(token),
         "token_preview": token[:8] + "..." if token else "",
-        "results": results,
+        "results":       results,
     })
 
 
